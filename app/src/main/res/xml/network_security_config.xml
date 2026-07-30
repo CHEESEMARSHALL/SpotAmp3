@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <!-- Explicit development/local Plex endpoints. Production Plex should use HTTPS. -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">10.0.2.2</domain>
+        <!-- Explicitly configured Plex endpoint used by the connected test device. -->
+        <domain includeSubdomains="false">140.186.136.228</domain>
+    </domain-config>
+</network-security-config>
