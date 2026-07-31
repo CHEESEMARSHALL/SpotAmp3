@@ -77,8 +77,31 @@ fun HomeScreen(
                 HomeHeader(
                     libraryName = selectedLibraryName,
                     isConfigured = isConfigured,
+                    source = homeFeedState.source,
                     onNavigateToSettings = onNavigateToSettings
                 )
+            }
+
+            homeFeedState.dailyMixes.firstOrNull()?.let { spotlight ->
+                item {
+                    HomeSpotlight(
+                        mix = spotlight,
+                        source = homeFeedState.source,
+                        baseUrl = baseUrl,
+                        token = token,
+                        onPlay = { viewModel.playDailyMix(spotlight) },
+                        onOpen = {
+                            onNavigateToCustomPlaylist(
+                                "daily_mix",
+                                spotlight.id,
+                                spotlight.title,
+                                spotlight.description,
+                                spotlight.tracks,
+                                spotlight.colors
+                            )
+                        }
+                    )
+                }
             }
 
             // Connection Check Banner (if Plex/Backend URL is unconfigured)
@@ -685,6 +708,7 @@ private fun StationDetailsDialog(
 fun HomeHeader(
     libraryName: String,
     isConfigured: Boolean,
+    source: HomeFeedSource,
     onNavigateToSettings: () -> Unit
 ) {
     Row(
@@ -706,7 +730,11 @@ fun HomeHeader(
                     modifier = Modifier.size(16.dp)
                 )
                 Text(
-                    text = if (isConfigured) "Connected" else "Offline Mode",
+                    text = when {
+                        source == HomeFeedSource.SPOTCORE -> "SPOTCORE CONNECTED"
+                        isConfigured -> "PLEX CONNECTED"
+                        else -> "OFFLINE MODE"
+                    },
                     style = MaterialTheme.typography.bodySmall.copy(
                         color = Color.White.copy(alpha = 0.5f),
                         fontWeight = FontWeight.Bold,
@@ -725,7 +753,11 @@ fun HomeHeader(
                 overflow = TextOverflow.Ellipsis
             )
             Text(
-                text = if (isConfigured) "Local-first • Plex metadata" else "Cached music • Offline capable",
+                text = when {
+                    source == HomeFeedSource.SPOTCORE -> "CLAP and taxonomy-powered discovery"
+                    isConfigured -> "Local-first • Plex metadata"
+                    else -> "Cached music • Offline capable"
+                },
                 style = MaterialTheme.typography.labelSmall.copy(
                     color = Color.White.copy(alpha = 0.45f),
                     letterSpacing = 0.2.sp
@@ -768,6 +800,122 @@ fun HomeHeader(
                     tint = Color.White.copy(alpha = 0.8f),
                     modifier = Modifier.size(18.dp)
                 )
+            }
+        }
+    }
+}
+
+@Composable
+fun HomeSpotlight(
+    mix: DailyMix,
+    source: HomeFeedSource,
+    baseUrl: String,
+    token: String,
+    onPlay: () -> Unit,
+    onOpen: () -> Unit
+) {
+    val context = LocalContext.current
+    val cover = mix.tracks.firstOrNull()?.thumb.orEmpty()
+    val imageRequest = remember(cover, baseUrl, token) {
+        cover.takeIf(String::isNotBlank)?.let {
+            authenticatedArtworkRequest(context, resolveArtworkUrl(baseUrl, it), token)
+        }
+    }
+    val colors = mix.colors.map(::Color).ifEmpty {
+        listOf(Color(0xFF312E81), Color(0xFF0E7490))
+    }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            .height(190.dp)
+            .clickable(onClick = onOpen),
+        shape = RoundedCornerShape(28.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.Transparent),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.12f))
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Brush.linearGradient(colors))
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(18.dp),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        text = if (source == HomeFeedSource.SPOTCORE) {
+                            "SPOTCORE INTELLIGENCE"
+                        } else {
+                            "MADE FOR YOU"
+                        },
+                        color = Color.White.copy(alpha = 0.78f),
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Black,
+                        letterSpacing = 1.1.sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = mix.title,
+                        color = Color.White,
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Black,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = mix.reason,
+                        color = Color.White.copy(alpha = 0.76f),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = 4.dp)
+                    )
+                    Button(
+                        onClick = onPlay,
+                        modifier = Modifier.padding(top = 12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = Color.White,
+                            contentColor = Color(0xFF111827)
+                        )
+                    ) {
+                        Icon(Icons.Rounded.PlayArrow, contentDescription = null)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Play", fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Box(
+                    modifier = Modifier
+                        .size(132.dp)
+                        .clip(RoundedCornerShape(22.dp))
+                        .background(Color.Black.copy(alpha = 0.18f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (imageRequest != null) {
+                        AsyncImage(
+                            model = imageRequest,
+                            contentDescription = mix.title,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Rounded.AutoAwesome,
+                            contentDescription = null,
+                            tint = Color.White.copy(alpha = 0.7f),
+                            modifier = Modifier.size(56.dp)
+                        )
+                    }
+                }
             }
         }
     }
@@ -907,8 +1055,7 @@ fun RecentPlayCard(
     onMoreClick: () -> Unit
 ) {
     val context = LocalContext.current
-    val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (play.thumb.isNotEmpty()) "$normalizedBaseUrl${play.thumb}" else null
+    val imageUrl = if (play.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, play.thumb) else null
 
     Card(
         modifier = Modifier
@@ -931,11 +1078,7 @@ fun RecentPlayCard(
                 ) {
                     if (imageUrl != null) {
                         AsyncImage(
-                            model = ImageRequest.Builder(context)
-                                .data(imageUrl)
-                                .addHeader("X-Plex-Token", token)
-                                .crossfade(true)
-                                .build(),
+                            model = authenticatedArtworkRequest(context, imageUrl, token),
                             contentDescription = play.title,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
@@ -1212,15 +1355,14 @@ fun MixCard(
 ) {
     val gradientColors = mix.colors.map { Color(it) }
     val track = mix.tracks.firstOrNull()
-    val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
     val context = LocalContext.current
-    val imageRequest = remember(track?.thumb) {
+    val imageRequest = remember(track?.thumb, baseUrl, token) {
         if (track != null && track.thumb.isNotEmpty()) {
-            ImageRequest.Builder(context)
-                .data("$normalizedBaseUrl${track.thumb}")
-                .addHeader("X-Plex-Token", token)
-                .crossfade(true)
-                .build()
+            authenticatedArtworkRequest(
+                context,
+                resolveArtworkUrl(baseUrl, track.thumb),
+                token
+            )
         } else null
     }
 
@@ -1654,8 +1796,7 @@ fun LargeRecommendationCard(
     onAddQueueClick: () -> Unit
 ) {
     val context = LocalContext.current
-    val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (mfyItem.thumb.isNotEmpty()) "$normalizedBaseUrl${mfyItem.thumb}" else null
+    val imageUrl = if (mfyItem.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, mfyItem.thumb) else null
 
     Card(
         modifier = Modifier
@@ -1674,11 +1815,7 @@ fun LargeRecommendationCard(
             ) {
                 if (imageUrl != null) {
                     AsyncImage(
-                        model = ImageRequest.Builder(context)
-                                .data(imageUrl)
-                                .addHeader("X-Plex-Token", token)
-                            .crossfade(true)
-                            .build(),
+                        model = authenticatedArtworkRequest(context, imageUrl, token),
                         contentDescription = mfyItem.title,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
@@ -1964,8 +2101,7 @@ fun OnThisDaySection(
     onPlayClick: () -> Unit
 ) {
     val context = LocalContext.current
-    val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (onThisDay.thumb.isNotEmpty()) "$normalizedBaseUrl${onThisDay.thumb}" else null
+    val imageUrl = if (onThisDay.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, onThisDay.thumb) else null
 
     Column(
         modifier = Modifier.padding(horizontal = 16.dp),
@@ -2002,11 +2138,7 @@ fun OnThisDaySection(
                     ) {
                         if (imageUrl != null) {
                             AsyncImage(
-                                model = ImageRequest.Builder(context)
-                                    .data(imageUrl)
-                                    .addHeader("X-Plex-Token", token)
-                                    .crossfade(true)
-                                    .build(),
+                                model = authenticatedArtworkRequest(context, imageUrl, token),
                                 contentDescription = onThisDay.title,
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize()

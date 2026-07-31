@@ -17,6 +17,8 @@ import com.example.data.LibrarySyncState
 import com.example.playback.PlaybackManager
 import com.example.playback.TrackItem
 import com.example.data.HomeFeedState
+import com.example.data.BackendClientManager
+import com.example.data.BackendHomeMapper
 import com.example.sync.SyncScheduler
 import com.example.data.HomeRecommendationEngine
 import com.example.data.DailyMix
@@ -25,6 +27,9 @@ import com.example.data.RadioType
 import com.example.data.SmartSearchService
 import com.example.data.AppCommand
 import com.example.data.PlaybackCommandExecutor
+import com.example.data.LastFmScrobbler
+import android.content.Intent
+import android.net.Uri
 import com.example.data.toTrackItem
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.Job
@@ -117,14 +122,30 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
+    private val _companionRevision = MutableStateFlow(0)
 
     // Combined Reactive Home Feed State Flow
     val homeFeedState: StateFlow<HomeFeedState> = combine(
         recentlyAddedAlbums,
         recentlyPlayed,
-        cachedTracks
-    ) { recentAdded, history, cached ->
+        cachedTracks,
+        _companionRevision
+    ) { recentAdded, history, _, _ ->
         recommendationEngine.generateHomeFeed(recentAdded, history)
+    }.map { plexFeed ->
+        val settings = repository.settings
+        if (!settings.isCompanionConfigured) {
+            plexFeed
+        } else {
+            runCatching {
+                val response = BackendClientManager
+                    .getApiService(settings.companionBackendUrl)
+                    .getHomeFeed("Bearer ${settings.companionBackendToken}")
+                BackendHomeMapper.merge(response, plexFeed)
+            }.onFailure { error ->
+                Log.w("MusicViewModel", "SpotCore Home unavailable; using Plex fallback", error)
+            }.getOrDefault(plexFeed)
+        }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HomeFeedState())
 
     // Playlist and Download states
@@ -174,6 +195,18 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _lastFmSessionKeyFlow = MutableStateFlow(repository.settings.lastFmSessionKey)
     val lastFmSessionKeyFlow: StateFlow<String> = _lastFmSessionKeyFlow.asStateFlow()
+    private val _lastFmApiKeyFlow = MutableStateFlow(repository.settings.lastFmApiKey)
+    val lastFmApiKeyFlow: StateFlow<String> = _lastFmApiKeyFlow.asStateFlow()
+    private val _lastFmApiSecretFlow = MutableStateFlow(repository.settings.lastFmApiSecret)
+    val lastFmApiSecretFlow: StateFlow<String> = _lastFmApiSecretFlow.asStateFlow()
+    private val _lastFmNowPlayingFlow = MutableStateFlow(repository.settings.lastFmNowPlayingEnabled)
+    val lastFmNowPlayingFlow: StateFlow<Boolean> = _lastFmNowPlayingFlow.asStateFlow()
+    private val _lastFmScrobbleFlow = MutableStateFlow(repository.settings.lastFmScrobbleEnabled)
+    val lastFmScrobbleFlow: StateFlow<Boolean> = _lastFmScrobbleFlow.asStateFlow()
+    private val _lastFmPrivateFlow = MutableStateFlow(repository.settings.lastFmPrivateSession)
+    val lastFmPrivateFlow: StateFlow<Boolean> = _lastFmPrivateFlow.asStateFlow()
+    private val _lastFmAuthMessage = MutableStateFlow("")
+    val lastFmAuthMessage: StateFlow<String> = _lastFmAuthMessage.asStateFlow()
 
     private val _syncIntervalHoursFlow = MutableStateFlow(repository.settings.syncIntervalHours)
     val syncIntervalHoursFlow: StateFlow<Long> = _syncIntervalHoursFlow.asStateFlow()
@@ -430,9 +463,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         
         if (repository.settings.isConfigured) {
             loadLibraries()
-            if (repository.settings.sectionId.isNotEmpty()) {
-                loadInitialLibraryData()
-            }
+        }
+        if (repository.settings.sectionId.isNotEmpty() || repository.settings.isCompanionConfigured) {
+            loadInitialLibraryData()
         }
 
         viewModelScope.launch {
@@ -457,6 +490,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun updatePlaybackCredentials() {
         playbackManager.setCredentials(repository.settings.baseUrl, repository.settings.token)
+        playbackManager.setCompanionToken(repository.settings.companionBackendToken)
     }
 
     fun saveCredentials(baseUrl: String, token: String, lyricsDirectory: String = "") {
@@ -468,6 +502,47 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         if (repository.settings.isConfigured) {
             loadLibraries()
         }
+    }
+
+    fun updateLastFmApiKey(value: String) { repository.settings.lastFmApiKey = value; _lastFmApiKeyFlow.value = value }
+    fun updateLastFmApiSecret(value: String) { repository.settings.lastFmApiSecret = value; _lastFmApiSecretFlow.value = value }
+    fun updateLastFmNowPlaying(value: Boolean) { repository.settings.lastFmNowPlayingEnabled = value; _lastFmNowPlayingFlow.value = value }
+    fun updateLastFmScrobble(value: Boolean) { repository.settings.lastFmScrobbleEnabled = value; _lastFmScrobbleFlow.value = value }
+    fun updateLastFmPrivate(value: Boolean) { repository.settings.lastFmPrivateSession = value; _lastFmPrivateFlow.value = value }
+    fun disconnectLastFm() {
+        repository.settings.lastFmEnabled = false; repository.settings.lastFmUsername = ""; repository.settings.lastFmSessionKey = ""
+        _lastFmEnabledFlow.value = false; _lastFmUsernameFlow.value = ""; _lastFmSessionKeyFlow.value = ""
+        _lastFmAuthMessage.value = "Disconnected"
+    }
+    fun startLastFmAuthorization() {
+        viewModelScope.launch {
+            LastFmScrobbler.requestToken(repository.settings).onSuccess {
+                LastFmScrobbler.authorizationUrl(repository.settings)?.let { getApplication<Application>().startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(it)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                _lastFmAuthMessage.value = "Approve SpotAmp in your browser, then tap Complete auth."
+            }.onFailure { _lastFmAuthMessage.value = it.message ?: "Authorization failed" }
+        }
+    }
+    fun completeLastFmAuthorization() {
+        viewModelScope.launch {
+            LastFmScrobbler.completeAuthorization(repository.settings).onSuccess { name ->
+                _lastFmEnabledFlow.value = true; _lastFmUsernameFlow.value = name; _lastFmSessionKeyFlow.value = repository.settings.lastFmSessionKey
+                _lastFmAuthMessage.value = "Connected as $name"
+            }.onFailure { _lastFmAuthMessage.value = it.message ?: "Authorization failed" }
+        }
+    }
+
+    fun saveCompanionBackend(url: String, token: String) {
+        val normalizedUrl = url.trim().trimEnd('/')
+        val normalizedToken = token.trim()
+        if ((normalizedUrl.isBlank()) != (normalizedToken.isBlank())) {
+            postErrorMessage("Enter both the SpotCore URL and token, or clear both fields.")
+            return
+        }
+        repository.settings.companionBackendUrl = normalizedUrl
+        repository.settings.companionBackendToken = normalizedToken
+        playbackManager.setCompanionToken(normalizedToken)
+        _companionRevision.value += 1
+        clearErrorMessage()
     }
 
     fun selectLibrary(sectionId: String, name: String) {
@@ -730,6 +805,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     smartResults
                 } else if (com.example.data.SmartSearchService().isStructuredQuery(query) && repository.getCachedCount() > 0) {
                     emptyList()
+                } else if (repository.settings.isCompanionConfigured) {
+                    runCatching { repository.searchCompanion(query) }
+                        .getOrElse { repository.searchPlex(query) }
                 } else {
                     repository.searchPlex(query)
                 }
@@ -748,9 +826,9 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     fun syncLibraryCache() {
         val section = _selectedSectionId.value
-        if (section.isEmpty()) return
+        if (section.isEmpty() && !repository.settings.isCompanionConfigured) return
         viewModelScope.launch {
-            repository.startSync(section, restart = true)
+            repository.startSync(if (section.isEmpty()) "spotcore" else section, restart = true)
         }
     }
 
@@ -854,6 +932,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             key = key,
             thumb = meta.thumb ?: "",
             duration = meta.duration ?: 0L
+            ,albumRatingKey = meta.parentRatingKey
         )
     }
 

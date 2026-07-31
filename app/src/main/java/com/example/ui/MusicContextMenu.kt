@@ -37,7 +37,8 @@ sealed class ContextMenuItem {
         val album: String,
         val key: String,
         val thumb: String,
-        val duration: Long
+        val duration: Long,
+        val albumRatingKey: String? = null
     ) : ContextMenuItem() {
         fun toTrackItem() = TrackItem(
             ratingKey = ratingKey,
@@ -46,7 +47,8 @@ sealed class ContextMenuItem {
             album = album,
             key = key,
             thumb = thumb,
-            duration = duration
+            duration = duration,
+            albumRatingKey = albumRatingKey
         )
     }
 
@@ -396,7 +398,7 @@ fun MusicContextMenu(
                                 coroutineScope.launch {
                                     // Plex track details usually have parents, but to be simple and accurate, we find the track metadata
                                     // Since Plex track lists have parentRatingKey, let's navigate to the album
-                                    onNavigateToAlbum(item.ratingKey, item.album)
+                                    onNavigateToAlbum(item.albumRatingKey ?: item.ratingKey, item.album)
                                     onDismiss()
                                 }
                             }

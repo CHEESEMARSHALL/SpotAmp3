@@ -4,7 +4,8 @@ import android.content.Context
 import android.util.Log
 import android.widget.Toast
 import com.example.playback.TrackItem
-import com.example.BuildConfig
+import android.net.Uri
+import org.json.JSONObject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -22,7 +23,7 @@ object LastFmScrobbler {
     private val scope = CoroutineScope(Dispatchers.IO)
 
     fun updateNowPlaying(context: Context, settings: PlexSettingsManager, track: TrackItem) {
-        if (!isConfigured(settings)) return
+        if (!isConfigured(settings) || !settings.lastFmNowPlayingEnabled || settings.lastFmPrivateSession) return
 
         scope.launch {
             Log.d(TAG, "Updating Now Playing on Last.fm for track: ${track.title} by ${track.artist}")
@@ -38,10 +39,10 @@ object LastFmScrobbler {
                     "artist" to track.artist,
                     "track" to track.title,
                     "album" to track.album,
-                    "api_key" to BuildConfig.LASTFM_API_KEY,
+                    "api_key" to settings.lastFmApiKey,
                     "sk" to sessionKey
                 )
-                val signature = calculateSignature(params)
+                val signature = calculateSignature(params, settings.lastFmApiSecret)
                 params["api_sig"] = signature
                 params["format"] = "json"
 
@@ -69,7 +70,7 @@ object LastFmScrobbler {
     }
 
     fun scrobble(context: Context, settings: PlexSettingsManager, track: TrackItem) {
-        if (!isConfigured(settings)) return
+        if (!isConfigured(settings) || !settings.lastFmScrobbleEnabled || settings.lastFmPrivateSession) return
 
         scope.launch {
             Log.d(TAG, "Scrobbling to Last.fm: ${track.title} by ${track.artist}")
@@ -87,10 +88,10 @@ object LastFmScrobbler {
                     "track" to track.title,
                     "album" to track.album,
                     "timestamp" to timestamp,
-                    "api_key" to BuildConfig.LASTFM_API_KEY,
+                    "api_key" to settings.lastFmApiKey,
                     "sk" to sessionKey
                 )
-                val signature = calculateSignature(params)
+                val signature = calculateSignature(params, settings.lastFmApiSecret)
                 params["api_sig"] = signature
                 params["format"] = "json"
 
@@ -117,23 +118,65 @@ object LastFmScrobbler {
         }
     }
 
-    private fun calculateSignature(params: Map<String, String>): String {
+    private fun calculateSignature(params: Map<String, String>, secret: String): String {
         val sortedKeys = params.keys.sorted()
         val signatureBuilder = StringBuilder()
         for (key in sortedKeys) {
             signatureBuilder.append(key).append(params[key])
         }
-        signatureBuilder.append(BuildConfig.LASTFM_API_SECRET)
+        signatureBuilder.append(secret)
         return md5(signatureBuilder.toString())
     }
 
     private fun isConfigured(settings: PlexSettingsManager): Boolean {
         return settings.lastFmEnabled &&
             settings.lastFmUsername.isNotEmpty() &&
-            BuildConfig.LASTFM_API_KEY.isNotBlank() &&
-            !BuildConfig.LASTFM_API_KEY.contains("YOUR_LASTFM") &&
-            BuildConfig.LASTFM_API_SECRET.isNotBlank() &&
-            !BuildConfig.LASTFM_API_SECRET.contains("YOUR_LASTFM")
+            settings.lastFmApiKey.isNotBlank() && settings.lastFmApiSecret.isNotBlank() &&
+            settings.lastFmSessionKey.isNotBlank()
+    }
+
+    fun authorizationUrl(settings: PlexSettingsManager): String? {
+        if (settings.lastFmApiKey.isBlank()) return null
+        val token = settings.lastFmPendingToken
+        if (token.isBlank()) return null
+        return Uri.parse("https://www.last.fm/api/auth/").buildUpon()
+            .appendQueryParameter("api_key", settings.lastFmApiKey)
+            .appendQueryParameter("token", token).build().toString()
+    }
+
+    suspend fun requestToken(settings: PlexSettingsManager): Result<String> = withContext(Dispatchers.IO) {
+        requestAuth(settings, mapOf("method" to "auth.getToken", "api_key" to settings.lastFmApiKey))
+            .map { token -> settings.lastFmPendingToken = token; token }
+    }
+
+    suspend fun completeAuthorization(settings: PlexSettingsManager): Result<String> = withContext(Dispatchers.IO) {
+        val token = settings.lastFmPendingToken
+        if (token.isBlank()) return@withContext Result.failure(IllegalStateException("Start authorization first"))
+        requestAuth(settings, mapOf("method" to "auth.getSession", "api_key" to settings.lastFmApiKey, "token" to token))
+            .map { raw ->
+                val session = JSONObject(raw).getJSONObject("session")
+                settings.lastFmUsername = session.getString("name")
+                settings.lastFmSessionKey = session.getString("key")
+                settings.lastFmPendingToken = ""
+                settings.lastFmEnabled = true
+                settings.lastFmUsername
+            }
+    }
+
+    private fun requestAuth(settings: PlexSettingsManager, values: Map<String, String>): Result<String> {
+        if (settings.lastFmApiKey.isBlank() || settings.lastFmApiSecret.isBlank()) return Result.failure(IllegalStateException("Enter API key and shared secret"))
+        return try {
+            val params = values.toMutableMap()
+            params["api_sig"] = calculateSignature(params, settings.lastFmApiSecret)
+            params["format"] = "json"
+            val body = FormBody.Builder().apply { params.forEach { (k, v) -> add(k, v) } }.build()
+            client.newCall(Request.Builder().url(BASE_URL).post(body).build()).execute().use { response ->
+                val raw = response.body?.string().orEmpty()
+                if (!response.isSuccessful) Result.failure(IllegalStateException("Last.fm HTTP ${response.code}"))
+                else if (JSONObject(raw).has("error")) Result.failure(IllegalStateException(JSONObject(raw).optString("message", "Last.fm authorization failed")))
+                else Result.success(if (values["method"] == "auth.getToken") JSONObject(raw).getString("token") else raw)
+            }
+        } catch (e: Exception) { Result.failure(e) }
     }
 
     private fun md5(input: String): String {

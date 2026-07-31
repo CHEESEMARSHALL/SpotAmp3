@@ -55,6 +55,7 @@ data class PlexMetadata(
     ,@Json(name = "Genre") val genres: List<PlexTag>? = null
     ,@Json(name = "Collection") val collections: List<PlexTag>? = null
     ,@Json(name = "grandparentRatingKey") val grandparentRatingKey: String? = null
+    ,@Json(name = "parentRatingKey") val parentRatingKey: String? = null
 )
 
 @JsonClass(generateAdapter = true)

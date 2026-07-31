@@ -122,8 +122,14 @@ data class HomeFeedState(
     val mostPlayedThisMonth: List<MostPlayedItem> = emptyList(),
     val onThisDay: OnThisDayItem? = null,
     val newReleases: List<NewReleaseItem> = emptyList(),
-    val history: List<RecentTrack> = emptyList()
+    val history: List<RecentTrack> = emptyList(),
+    val source: HomeFeedSource = HomeFeedSource.PLEX
 )
+
+enum class HomeFeedSource {
+    PLEX,
+    SPOTCORE
+}
 
 // ==========================================
 // 3. Recommendation Engine Implementation

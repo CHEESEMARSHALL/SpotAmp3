@@ -21,13 +21,14 @@ class LibrarySyncWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         setForeground(getForegroundInfo())
-        val sectionId = inputData.getString("sectionId") ?: return@withContext Result.failure()
+        val sectionId = inputData.getString("sectionId") ?: "spotcore"
         Log.d("LibrarySyncWorker", "Starting sync for section: $sectionId")
         val musicDao = MusicDatabase.getDatabase(applicationContext).musicDao()
         val settings = PlexSettingsManager(applicationContext)
-        Log.d("LibrarySyncWorker", "Settings configured: ${settings.isConfigured}")
+        val useCompanion = settings.isCompanionConfigured
+        Log.d("LibrarySyncWorker", "Plex configured: ${settings.isConfigured}; SpotCore configured: $useCompanion")
 
-        if (!settings.isConfigured) return@withContext Result.failure()
+        if (!settings.isConfigured && !useCompanion) return@withContext Result.failure()
 
         val syncId = System.currentTimeMillis()
         val restart = inputData.getBoolean("restart", false)
@@ -40,49 +41,39 @@ class LibrarySyncWorker(
         var offset = initialOffset
         
         try {
-            val service = PlexClientManager.getApiService(settings.baseUrl)
-            
+            val service = if (!useCompanion) PlexClientManager.getApiService(settings.baseUrl) else null
+            val companion = if (useCompanion) BackendClientManager.getApiService(settings.companionBackendUrl) else null
+
             while (true) {
                 // Fetch page
-                val container = service.getLibraryItems(sectionId, "10", offset, pageSize, settings.token)
-                    .mediaContainer
-                val page = container.metadata.orEmpty()
-                
-                if (page.isEmpty()) break
+                val plexPage = service?.getLibraryItems(sectionId, "10", offset, pageSize, settings.token)
+                val companionPage = companion?.getLibraryTracks(pageSize, offset, "Bearer ${settings.companionBackendToken}")
+                val page = plexPage?.mediaContainer?.metadata.orEmpty()
+                val backendTracks = companionPage?.tracks.orEmpty()
 
-                val totalTracks = container.totalSize ?: 0
+                if (page.isEmpty() && backendTracks.isEmpty()) break
 
-                val entities = page.mapNotNull { track ->
+                val totalTracks = plexPage?.mediaContainer?.totalSize ?: 0
+
+                val entities = if (useCompanion) backendTracks.map { track ->
+                    CachedTrack(track.id, track.title, track.artist, track.album, track.streamUrl, track.coverUrl,
+                        track.duration, track.year, null, 0, null, track.genre.orEmpty(), "", syncId)
+                } else page.mapNotNull { track ->
                     val trackKey = track.media?.firstOrNull()?.part?.firstOrNull()?.key
-                    if (trackKey.isNullOrEmpty()) {
-                        null
-                    } else {
-                        CachedTrack(
-                            ratingKey = track.ratingKey,
-                            title = track.title,
-                            artist = track.grandparentTitle ?: track.parentTitle ?: "Unknown Artist",
-                            album = track.parentTitle ?: "Unknown Album",
-                            key = trackKey,
-                            thumb = track.thumb ?: "",
-                            duration = track.duration ?: 0L,
-                            year = track.year,
-                            addedAt = track.addedAt,
-                            playCount = track.viewCount ?: 0,
-                            lastPlayedAt = track.lastViewedAt,
-                            genres = track.genres.orEmpty().joinToString("|") { it.tag },
-                            collections = track.collections.orEmpty().joinToString("|") { it.tag },
-                            syncId = syncId
-                        )
-                    }
+                    trackKey?.let { CachedTrack(track.ratingKey, track.title, track.grandparentTitle ?: track.parentTitle ?: "Unknown Artist",
+                        track.parentTitle ?: "Unknown Album", it, track.thumb ?: "", track.duration ?: 0L, track.year,
+                        track.addedAt, track.viewCount ?: 0, track.lastViewedAt,
+                        track.genres.orEmpty().joinToString("|") { tag -> tag.tag },
+                        track.collections.orEmpty().joinToString("|") { tag -> tag.tag }, syncId) }
                 }
 
                 musicDao.insertCachedTracks(entities)
                 
-                offset += page.size
+                offset += if (useCompanion) backendTracks.size else page.size
                 syncState = syncState.copy(currentOffset = offset, totalTracks = totalTracks)
                 musicDao.insertSyncState(syncState)
                 
-                if (page.size < pageSize) break
+                if ((if (useCompanion) backendTracks.size else page.size) < pageSize) break
             }
             
             musicDao.deleteStaleTracks(syncId)

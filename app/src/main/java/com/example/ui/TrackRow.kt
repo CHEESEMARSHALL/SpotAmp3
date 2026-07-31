@@ -21,7 +21,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
-import coil.request.ImageRequest
 import com.example.data.CachedTrack
 
 @Composable
@@ -34,8 +33,7 @@ fun TrackRow(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
-    val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (track.thumb.isNotEmpty()) "$normalizedBaseUrl${track.thumb}" else null
+    val imageUrl = if (track.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, track.thumb) else null
 
     Row(
         modifier = modifier
@@ -50,11 +48,7 @@ fun TrackRow(
         ) {
             if (imageUrl != null) {
                 AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(imageUrl)
-                        .addHeader("X-Plex-Token", token)
-                        .crossfade(true)
-                        .build(),
+                    model = authenticatedArtworkRequest(context, imageUrl, token),
                     contentDescription = track.title,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()

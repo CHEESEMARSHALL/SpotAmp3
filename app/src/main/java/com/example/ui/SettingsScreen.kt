@@ -47,6 +47,9 @@ fun SettingsScreen(
     var tokenInput by remember { mutableStateOf(viewModel.repository.settings.token) }
     var lyricsDirInput by remember { mutableStateOf(viewModel.repository.settings.lyricsDirectory) }
     var hideToken by remember { mutableStateOf(true) }
+    var companionUrlInput by remember { mutableStateOf(viewModel.repository.settings.companionBackendUrl) }
+    var companionTokenInput by remember { mutableStateOf(viewModel.repository.settings.companionBackendToken) }
+    var hideCompanionToken by remember { mutableStateOf(true) }
 
     val cleanupSuggestions by produceState<List<LibraryCleanupSuggestion>>(emptyList(), cachedCount, selectedSectionId) {
         value = runCatching {
@@ -180,6 +183,116 @@ fun SettingsScreen(
         val inputUnfocusedContainer = if (isLightTheme) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f) else Color.Black.copy(alpha = 0.4f)
         val inputFocusedBorder = if (isLightTheme) MaterialTheme.colorScheme.primary else Color(0xFF6366F1).copy(alpha = 0.5f)
         val inputUnfocusedBorder = if (isLightTheme) MaterialTheme.colorScheme.outline.copy(alpha = 0.3f) else Color.White.copy(alpha = 0.05f)
+
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 24.dp),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = cardBgColor),
+            border = cardBorder,
+            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        imageVector = Icons.Rounded.Hub,
+                        contentDescription = null,
+                        tint = Color(0xFF22D3EE)
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column {
+                        Text(
+                            text = "SpotCore Companion",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = labelColor,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = if (viewModel.repository.settings.isCompanionConfigured) {
+                                "Analysis-powered Home is enabled"
+                            } else {
+                                "Optional • Plex remains the fallback"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = subLabelColor
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                OutlinedTextField(
+                    value = companionUrlInput,
+                    onValueChange = { companionUrlInput = it },
+                    label = { Text("SpotCore URL") },
+                    placeholder = { Text("http://192.168.1.50:4182", color = placeholderColor) },
+                    supportingText = { Text("Use the PC's LAN address and companion port.") },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = inputFocusedText,
+                        unfocusedTextColor = inputUnfocusedText,
+                        focusedBorderColor = inputFocusedBorder,
+                        unfocusedBorderColor = inputUnfocusedBorder,
+                        focusedContainerColor = inputFocusedContainer,
+                        unfocusedContainerColor = inputUnfocusedContainer
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("companion_url_input"),
+                    shape = RoundedCornerShape(16.dp)
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = companionTokenInput,
+                    onValueChange = { companionTokenInput = it },
+                    label = { Text("Companion token") },
+                    singleLine = true,
+                    visualTransformation = if (hideCompanionToken) PasswordVisualTransformation() else VisualTransformation.None,
+                    trailingIcon = {
+                        IconButton(onClick = { hideCompanionToken = !hideCompanionToken }) {
+                            Icon(
+                                imageVector = if (hideCompanionToken) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility,
+                                contentDescription = "Toggle companion token visibility"
+                            )
+                        }
+                    },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = inputFocusedText,
+                        unfocusedTextColor = inputUnfocusedText,
+                        focusedBorderColor = inputFocusedBorder,
+                        unfocusedBorderColor = inputUnfocusedBorder,
+                        focusedContainerColor = inputFocusedContainer,
+                        unfocusedContainerColor = inputUnfocusedContainer
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("companion_token_input"),
+                    shape = RoundedCornerShape(16.dp)
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+                Button(
+                    onClick = {
+                        viewModel.saveCompanionBackend(companionUrlInput, companionTokenInput)
+                    },
+                    enabled = (companionUrlInput.isBlank() && companionTokenInput.isBlank()) ||
+                        (companionUrlInput.isNotBlank() && companionTokenInput.isNotBlank()),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("save_companion_button"),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Text(
+                        if (companionUrlInput.isBlank() && companionTokenInput.isBlank()) {
+                            "Disable Companion"
+                        } else {
+                            "Save Companion"
+                        },
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
 
         Card(
             modifier = Modifier
@@ -1086,10 +1199,14 @@ fun SettingsScreen(
             // Last.fm Scrobbler Integration
             val lastFmEnabled by viewModel.lastFmEnabledFlow.collectAsStateWithLifecycle()
             val lastFmUsername by viewModel.lastFmUsernameFlow.collectAsStateWithLifecycle()
-            val lastFmSessionKey by viewModel.lastFmSessionKeyFlow.collectAsStateWithLifecycle()
-
-            var lastFmUserText by remember { mutableStateOf(lastFmUsername) }
-            var lastFmSessionText by remember { mutableStateOf(lastFmSessionKey) }
+            val lastFmApiKey by viewModel.lastFmApiKeyFlow.collectAsStateWithLifecycle()
+            val lastFmApiSecret by viewModel.lastFmApiSecretFlow.collectAsStateWithLifecycle()
+            val lastFmNowPlaying by viewModel.lastFmNowPlayingFlow.collectAsStateWithLifecycle()
+            val lastFmScrobble by viewModel.lastFmScrobbleFlow.collectAsStateWithLifecycle()
+            val lastFmPrivate by viewModel.lastFmPrivateFlow.collectAsStateWithLifecycle()
+            val lastFmAuthMessage by viewModel.lastFmAuthMessage.collectAsStateWithLifecycle()
+            var lastFmApiKeyText by remember(lastFmApiKey) { mutableStateOf(lastFmApiKey) }
+            var lastFmApiSecretText by remember(lastFmApiSecret) { mutableStateOf(lastFmApiSecret) }
 
             Card(
                 modifier = Modifier
@@ -1114,59 +1231,42 @@ fun SettingsScreen(
                             )
                             Spacer(modifier = Modifier.width(12.dp))
                             Text(
-                                text = "Last.fm Scrobbler",
+                                text = "Last.fm scrobbling",
                                 style = MaterialTheme.typography.titleMedium.copy(
                                     fontWeight = FontWeight.Bold,
                                     color = Color.White
                                 )
                             )
                         }
-                        Switch(
-                            checked = lastFmEnabled,
-                            onCheckedChange = { viewModel.updateLastFmEnabled(it) },
-                            colors = SwitchDefaults.colors(checkedThumbColor = Color(0xFF818CF8))
-                        )
+                        Switch(checked = lastFmEnabled, onCheckedChange = { viewModel.updateLastFmEnabled(it) })
                     }
 
                     Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        "Scrobble played tracks automatically to Last.fm database",
+                        "Send listens to your Last.fm account after authorization",
                         color = Color.White.copy(alpha = 0.6f),
                         fontSize = 11.sp
                     )
 
-                    if (lastFmEnabled) {
-                        Spacer(modifier = Modifier.height(14.dp))
-                        OutlinedTextField(
-                            value = lastFmUserText,
-                            onValueChange = { lastFmUserText = it; viewModel.updateLastFmUsername(it) },
-                            label = { Text("Last.fm Username", color = Color.White.copy(alpha = 0.6f)) },
-                            singleLine = true,
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White,
-                                focusedContainerColor = Color.Black.copy(alpha = 0.3f),
-                                unfocusedContainerColor = Color.Black.copy(alpha = 0.3f)
-                            ),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        OutlinedTextField(
-                            value = lastFmSessionText,
-                            onValueChange = { lastFmSessionText = it; viewModel.updateLastFmSessionKey(it) },
-                            label = { Text("Last.fm Session Key", color = Color.White.copy(alpha = 0.6f)) },
-                            singleLine = true,
-                            visualTransformation = PasswordVisualTransformation(),
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White,
-                                focusedContainerColor = Color.Black.copy(alpha = 0.3f),
-                                unfocusedContainerColor = Color.Black.copy(alpha = 0.3f)
-                            ),
-                            modifier = Modifier.fillMaxWidth()
-                        )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    @Composable fun settingToggle(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) { Text(label, color = Color.White); Switch(checked, onChange) }
+                    }
+                    settingToggle("Now Playing", lastFmNowPlaying, viewModel::updateLastFmNowPlaying)
+                    settingToggle("Scrobble listens", lastFmScrobble, viewModel::updateLastFmScrobble)
+                    settingToggle("Private session", lastFmPrivate, viewModel::updateLastFmPrivate)
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(lastFmApiKeyText, { lastFmApiKeyText = it }, label = { Text("API key") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(lastFmApiSecretText, { lastFmApiSecretText = it }, label = { Text("Shared secret") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(if (lastFmUsername.isBlank()) "Not connected" else "Connected as $lastFmUsername", color = Color.White.copy(alpha = 0.75f), fontSize = 12.sp)
+                    if (lastFmAuthMessage.isNotBlank()) Text(lastFmAuthMessage, color = Color(0xFF6EE7B7), fontSize = 12.sp)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
+                        Button(onClick = { viewModel.updateLastFmApiKey(lastFmApiKeyText); viewModel.updateLastFmApiSecret(lastFmApiSecretText) }) { Text("Save Last.fm") }
+                        OutlinedButton(onClick = viewModel::startLastFmAuthorization) { Text("Start auth") }
+                        OutlinedButton(onClick = viewModel::completeLastFmAuthorization) { Text("Complete auth") }
+                        OutlinedButton(onClick = viewModel::disconnectLastFm) { Text("Disconnect") }
                     }
                 }
             }

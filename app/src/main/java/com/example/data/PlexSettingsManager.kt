@@ -14,6 +14,8 @@ class PlexSettingsManager(context: Context) {
         private const val LEGACY_PREFS_NAME = "plex_settings"
         private const val KEY_BASE_URL = "plex_base_url"
         private const val KEY_TOKEN = "plex_token"
+        private const val KEY_COMPANION_URL = "companion_backend_url"
+        private const val KEY_COMPANION_TOKEN = "companion_backend_token"
         private const val KEY_SECTION_ID = "plex_section_id"
         private const val KEY_LIBRARY_NAME = "plex_library_name"
         
@@ -21,6 +23,12 @@ class PlexSettingsManager(context: Context) {
         private const val KEY_LASTFM_ENABLED = "lastfm_enabled"
         private const val KEY_LASTFM_USERNAME = "lastfm_username"
         private const val KEY_LASTFM_SESSION_KEY = "lastfm_session_key"
+        private const val KEY_LASTFM_API_KEY = "lastfm_api_key"
+        private const val KEY_LASTFM_API_SECRET = "lastfm_api_secret"
+        private const val KEY_LASTFM_NOW_PLAYING = "lastfm_now_playing"
+        private const val KEY_LASTFM_SCROBBLE = "lastfm_scrobble_enabled"
+        private const val KEY_LASTFM_PRIVATE = "lastfm_private_session"
+        private const val KEY_LASTFM_PENDING_TOKEN = "lastfm_pending_token"
         
         private const val KEY_GAPLESS = "gapless_enabled"
         private const val KEY_EQ_ENABLED = "eq_enabled"
@@ -47,10 +55,10 @@ class PlexSettingsManager(context: Context) {
         )
         if (prefs.getString(KEY_TOKEN, null).isNullOrEmpty() && legacy.getString(KEY_TOKEN, null).orEmpty().isNotEmpty()) {
             val migration = prefs.edit()
-            listOf(KEY_BASE_URL, KEY_TOKEN, KEY_SECTION_ID, KEY_LIBRARY_NAME, KEY_LASTFM_USERNAME, KEY_LASTFM_SESSION_KEY, KEY_THEME, KEY_EQ_PRESET, KEY_AI_PROVIDER).forEach { key ->
+            listOf(KEY_BASE_URL, KEY_TOKEN, KEY_SECTION_ID, KEY_LIBRARY_NAME, KEY_LASTFM_USERNAME, KEY_LASTFM_SESSION_KEY, KEY_LASTFM_API_KEY, KEY_LASTFM_API_SECRET, KEY_LASTFM_PENDING_TOKEN, KEY_THEME, KEY_EQ_PRESET, KEY_AI_PROVIDER).forEach { key ->
                 legacy.getString(key, null)?.let { migration.putString(key, it) }
             }
-            listOf(KEY_LASTFM_ENABLED, KEY_GAPLESS, KEY_EQ_ENABLED, KEY_NORMALIZATION).forEach { key ->
+            listOf(KEY_LASTFM_ENABLED, KEY_LASTFM_NOW_PLAYING, KEY_LASTFM_SCROBBLE, KEY_LASTFM_PRIVATE, KEY_GAPLESS, KEY_EQ_ENABLED, KEY_NORMALIZATION).forEach { key ->
                 if (legacy.contains(key)) migration.putBoolean(key, legacy.getBoolean(key, false))
             }
             migration.apply()
@@ -72,6 +80,25 @@ class PlexSettingsManager(context: Context) {
     var lastFmSessionKey: String
         get() = prefs.getString(KEY_LASTFM_SESSION_KEY, "") ?: ""
         set(value) = prefs.edit().putString(KEY_LASTFM_SESSION_KEY, value).apply()
+
+    var lastFmApiKey: String
+        get() = prefs.getString(KEY_LASTFM_API_KEY, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_LASTFM_API_KEY, value.trim()).apply()
+    var lastFmApiSecret: String
+        get() = prefs.getString(KEY_LASTFM_API_SECRET, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_LASTFM_API_SECRET, value.trim()).apply()
+    var lastFmNowPlayingEnabled: Boolean
+        get() = prefs.getBoolean(KEY_LASTFM_NOW_PLAYING, true)
+        set(value) = prefs.edit().putBoolean(KEY_LASTFM_NOW_PLAYING, value).apply()
+    var lastFmScrobbleEnabled: Boolean
+        get() = prefs.getBoolean(KEY_LASTFM_SCROBBLE, true)
+        set(value) = prefs.edit().putBoolean(KEY_LASTFM_SCROBBLE, value).apply()
+    var lastFmPrivateSession: Boolean
+        get() = prefs.getBoolean(KEY_LASTFM_PRIVATE, false)
+        set(value) = prefs.edit().putBoolean(KEY_LASTFM_PRIVATE, value).apply()
+    var lastFmPendingToken: String
+        get() = prefs.getString(KEY_LASTFM_PENDING_TOKEN, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_LASTFM_PENDING_TOKEN, value).apply()
 
     var gaplessEnabled: Boolean
         get() = prefs.getBoolean(KEY_GAPLESS, true)
@@ -132,6 +159,17 @@ class PlexSettingsManager(context: Context) {
             return if (envToken.isNotEmpty() && !envToken.contains("YOUR_PLEX_TOKEN")) envToken else ""
         }
         set(value) = prefs.edit().putString(KEY_TOKEN, value).apply()
+
+    var companionBackendUrl: String
+        get() = prefs.getString(KEY_COMPANION_URL, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_COMPANION_URL, value).apply()
+
+    var companionBackendToken: String
+        get() = prefs.getString(KEY_COMPANION_TOKEN, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_COMPANION_TOKEN, value).apply()
+
+    val isCompanionConfigured: Boolean
+        get() = companionBackendUrl.isNotBlank() && companionBackendToken.isNotBlank()
 
     var sectionId: String
         get() = prefs.getString(KEY_SECTION_ID, "") ?: ""

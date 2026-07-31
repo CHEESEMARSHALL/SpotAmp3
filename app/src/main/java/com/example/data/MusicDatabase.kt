@@ -152,7 +152,7 @@ interface MusicDao {
     suspend fun getCachedTracksCount(): Int
 
     // Recently played history
-    @Query("SELECT * FROM recently_played ORDER BY timestamp DESC LIMIT 30")
+    @Query("SELECT recently_played.* FROM recently_played INNER JOIN cached_tracks ON cached_tracks.ratingKey = recently_played.ratingKey ORDER BY timestamp DESC LIMIT 30")
     fun getRecentlyPlayed(): Flow<List<RecentTrack>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -171,10 +171,10 @@ interface MusicDao {
     @Query("DELETE FROM playlists WHERE id = :playlistId")
     suspend fun deletePlaylist(playlistId: Int)
 
-    @Query("SELECT * FROM playlist_tracks WHERE playlistId = :playlistId ORDER BY addedAt ASC")
+    @Query("SELECT playlist_tracks.* FROM playlist_tracks INNER JOIN cached_tracks ON cached_tracks.ratingKey = playlist_tracks.ratingKey WHERE playlistId = :playlistId ORDER BY addedAt ASC")
     fun getTracksForPlaylist(playlistId: Int): Flow<List<PlaylistTrackEntity>>
 
-    @Query("SELECT * FROM playlist_tracks WHERE playlistId = :playlistId ORDER BY addedAt ASC")
+    @Query("SELECT playlist_tracks.* FROM playlist_tracks INNER JOIN cached_tracks ON cached_tracks.ratingKey = playlist_tracks.ratingKey WHERE playlistId = :playlistId ORDER BY addedAt ASC")
     suspend fun getTracksForPlaylistList(playlistId: Int): List<PlaylistTrackEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)

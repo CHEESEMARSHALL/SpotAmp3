@@ -29,7 +29,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
-import coil.request.ImageRequest
 import com.example.playback.PlaybackManager
 
 @Composable
@@ -49,9 +48,8 @@ fun BottomMiniPlayer(
     if (currentTrack == null) return
 
     val context = LocalContext.current
-    val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
     val imageUrl = currentTrack?.let {
-        if (it.thumb.isNotEmpty()) "$normalizedBaseUrl${it.thumb}" else null
+        if (it.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, it.thumb) else null
     }
 
     Column(
@@ -92,11 +90,7 @@ fun BottomMiniPlayer(
             ) {
                 if (imageUrl != null) {
                     AsyncImage(
-                        model = ImageRequest.Builder(context)
-                            .data(imageUrl)
-                            .addHeader("X-Plex-Token", token)
-                            .crossfade(true)
-                            .build(),
+                        model = authenticatedArtworkRequest(context, imageUrl, token),
                         contentDescription = currentTrack?.title,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()

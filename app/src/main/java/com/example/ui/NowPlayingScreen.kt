@@ -35,7 +35,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.Player
 import coil.compose.AsyncImage
 
-import coil.request.ImageRequest
 import com.example.playback.PlaybackManager
 import com.example.playback.TrackItem
 import com.example.data.LocalDjBlurbService
@@ -68,9 +67,8 @@ fun NowPlayingScreen(
     var showLyrics by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
-    val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
     val imageUrl = currentTrack?.let {
-        if (it.thumb.isNotEmpty()) "$normalizedBaseUrl${it.thumb}" else null
+        if (it.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, it.thumb) else null
     }
 
     val spectrum = remember { FloatArray(48) }
@@ -93,11 +91,7 @@ fun NowPlayingScreen(
         // 1. Blurred Background Artwork
         if (imageUrl != null) {
             AsyncImage(
-                model = ImageRequest.Builder(context)
-                    .data(imageUrl)
-                    .addHeader("X-Plex-Token", token)
-                    .crossfade(true)
-                    .build(),
+                model = authenticatedArtworkRequest(context, imageUrl, token),
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier
@@ -263,7 +257,7 @@ fun NowPlayingScreen(
                                     overflow = TextOverflow.Ellipsis,
                                     modifier = Modifier.clickable {
                                         onCollapse()
-                                        onNavigateToAlbum(track.ratingKey, track.album)
+                                        onNavigateToAlbum(track.albumRatingKey ?: track.ratingKey, track.album)
                                     }
                                 )
 
@@ -365,7 +359,7 @@ fun NowPlayingScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 val trackImgUrl = if (track.thumb.isNotEmpty()) {
-                                    "$normalizedBaseUrl${track.thumb}"
+                                    resolveArtworkUrl(baseUrl, track.thumb)
                                 } else null
 
                                 Card(
@@ -374,11 +368,7 @@ fun NowPlayingScreen(
                                 ) {
                                     if (trackImgUrl != null) {
                                         AsyncImage(
-                                            model = ImageRequest.Builder(context)
-                                                .data(trackImgUrl)
-                                                .addHeader("X-Plex-Token", token)
-                                                .crossfade(true)
-                                                .build(),
+                                            model = authenticatedArtworkRequest(context, trackImgUrl, token),
                                             contentDescription = null,
                                             contentScale = ContentScale.Crop,
                                             modifier = Modifier.fillMaxSize()

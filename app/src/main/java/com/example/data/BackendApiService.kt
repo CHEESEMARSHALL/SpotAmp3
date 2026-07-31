@@ -23,6 +23,13 @@ data class BackendHomeFeedResponse(
 )
 
 @JsonClass(generateAdapter = true)
+data class BackendPlaylistDto(
+    @Json(name = "id") val id: String,
+    @Json(name = "name") val name: String,
+    @Json(name = "trackCount") val trackCount: Int? = null
+)
+
+@JsonClass(generateAdapter = true)
 data class BackendTrackDto(
     @Json(name = "id") val id: String,
     @Json(name = "title") val title: String,
@@ -89,6 +96,25 @@ data class BackendOnThisDayDto(
 // ==========================================
 
 interface BackendApiService {
+
+    // The companion's normalized library contract. These are the first
+    // endpoints used to replace direct Plex reads in MusicRepository.
+    @GET("api/v1/library/tracks")
+    suspend fun getLibraryTracks(
+        @Query("limit") limit: Int = 100,
+        @Query("offset") offset: Int = 0,
+        @Header("Authorization") userAuthToken: String? = null
+    ): BackendEnvelope
+
+    @GET("api/v1/library/search")
+    suspend fun searchLibrary(
+        @Query("q") query: String,
+        @Query("limit") limit: Int = 100,
+        @Header("Authorization") userAuthToken: String? = null
+    ): BackendEnvelope
+
+    @GET("api/v1/playlists")
+    suspend fun getPlaylists(@Header("Authorization") userAuthToken: String? = null): BackendEnvelope
     
     // GET personalized home feed from your proxy backend
     @GET("api/v1/music/home")
@@ -113,6 +139,13 @@ interface BackendApiService {
     @GET("api/v1/music/on-this-day")
     suspend fun getOnThisDayContent(): BackendOnThisDayDto
 }
+
+@JsonClass(generateAdapter = true)
+data class BackendEnvelope(
+    @Json(name = "contractVersion") val contractVersion: String? = null,
+    @Json(name = "tracks") val tracks: List<BackendTrackDto>? = null,
+    @Json(name = "playlists") val playlists: List<BackendPlaylistDto>? = null
+)
 
 // ==========================================
 // Retrofit Client Manager for Backend Proxy

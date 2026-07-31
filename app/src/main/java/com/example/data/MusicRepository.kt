@@ -165,13 +165,20 @@ class MusicRepository(private val context: Context) {
     }
 
     suspend fun downloadTrack(track: TrackItem, onProgress: (Float) -> Unit = {}): DownloadedTrackEntity = withContext(Dispatchers.IO) {
-        if (!settings.isConfigured) throw IllegalStateException("Plex server is not configured.")
+        if (!settings.isConfigured && !settings.isCompanionConfigured) throw IllegalStateException("No music backend is configured.")
         val targetDir = context.getExternalFilesDir("music") ?: File(context.filesDir, "music")
         targetDir.mkdirs()
         val extension = track.key.substringAfterLast('.', "mp3").takeIf { it.length in 2..5 } ?: "mp3"
         val target = File(targetDir, "${track.ratingKey}.$extension")
-        val url = "${settings.baseUrl.trimEnd('/')}${track.key}"
-        val request = Request.Builder().url(url).header("X-Plex-Token", settings.token).build()
+        val isCompanionUrl = track.key.startsWith("http://") || track.key.startsWith("https://")
+        val url = if (isCompanionUrl) track.key else "${settings.baseUrl.trimEnd('/')}${track.key}"
+        val requestBuilder = Request.Builder().url(url)
+        if (isCompanionUrl && settings.companionBackendToken.isNotBlank()) {
+            requestBuilder.header("Authorization", "Bearer ${settings.companionBackendToken}")
+        } else if (settings.token.isNotBlank()) {
+            requestBuilder.header("X-Plex-Token", settings.token)
+        }
+        val request = requestBuilder.build()
         var completed = false
         try {
             okhttp3.OkHttpClient().newCall(request).execute().use { response ->
@@ -294,6 +301,33 @@ class MusicRepository(private val context: Context) {
             searchCachedTracks(query)
         }
     }
+
+    /**
+     * Searches the SpotCore companion library contract. The returned model is
+     * intentionally mapped into the existing PlexMetadata shape so callers
+     * and offline queues remain unchanged during the migration.
+     */
+    suspend fun searchCompanion(query: String): List<PlexMetadata> = withContext(Dispatchers.IO) {
+        if (!settings.isCompanionConfigured || query.isBlank()) return@withContext emptyList()
+        val response = BackendClientManager
+            .getApiService(settings.companionBackendUrl)
+            .searchLibrary(query, userAuthToken = "Bearer ${settings.companionBackendToken}")
+        response.tracks.orEmpty().map { it.toPlexMetadata() }
+    }
+
+    private fun BackendTrackDto.toPlexMetadata(): PlexMetadata = PlexMetadata(
+        ratingKey = id,
+        key = streamUrl,
+        title = title,
+        type = "track",
+        thumb = coverUrl,
+        parentTitle = album,
+        grandparentTitle = artist,
+        duration = duration,
+        year = year,
+        genres = genre?.let { listOf(PlexTag(it)) },
+        media = listOf(PlexMedia(listOf(PlexPart(streamUrl))))
+    )
 
     suspend fun smartSearch(query: String): List<PlexMetadata> = withContext(Dispatchers.IO) {
         val cached = musicDao.getCachedTracksList()

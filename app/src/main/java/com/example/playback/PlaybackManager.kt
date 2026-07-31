@@ -38,7 +38,8 @@ data class TrackItem(
     val thumb: String, // e.g. "/library/metadata/456/thumb/..."
     val duration: Long,
     val localPath: String? = null,
-    val genres: List<String> = emptyList()
+    val genres: List<String> = emptyList(),
+    val albumRatingKey: String? = null
 )
 
 class PlaybackManager private constructor(private val appContext: Context) {
@@ -90,6 +91,7 @@ class PlaybackManager private constructor(private val appContext: Context) {
         private set
     var token: String = ""
         private set
+    private var companionToken: String = ""
 
     // Last.fm Scrobbling support
     private var hasScrobbledCurrent = false
@@ -121,7 +123,20 @@ class PlaybackManager private constructor(private val appContext: Context) {
     fun setCredentials(baseUrl: String, token: String) {
         this.baseUrl = baseUrl
         this.token = token
-        httpDataSourceFactory?.setDefaultRequestProperties(mapOf("X-Plex-Token" to token))
+        updateHttpRequestHeaders()
+    }
+
+    fun setCompanionToken(token: String) {
+        companionToken = token.trim()
+        updateHttpRequestHeaders()
+    }
+
+    private fun updateHttpRequestHeaders() {
+        val headers = buildMap {
+            if (token.isNotBlank()) put("X-Plex-Token", token)
+            if (companionToken.isNotBlank()) put("Authorization", "Bearer $companionToken")
+        }
+        httpDataSourceFactory?.setDefaultRequestProperties(headers)
     }
 
     fun setMusicDao(dao: MusicDao) {
@@ -167,8 +182,9 @@ class PlaybackManager private constructor(private val appContext: Context) {
     private fun initializePlayer() {
         if (exoPlayer != null) return
 
-        val httpFactory = DefaultHttpDataSource.Factory().setDefaultRequestProperties(mapOf("X-Plex-Token" to token))
+        val httpFactory = DefaultHttpDataSource.Factory()
         httpDataSourceFactory = httpFactory
+        updateHttpRequestHeaders()
         exoPlayer = ExoPlayer.Builder(appContext)
             // Route local file:// downloads through FileDataSource and remote Plex media
             // through the authenticated HTTP factory.
@@ -353,7 +369,11 @@ class PlaybackManager private constructor(private val appContext: Context) {
     private fun mediaUri(track: TrackItem, normalizedBaseUrl: String = baseUrl.trimEnd('/')): String {
         val localFile = getLocalAudioFile(track)
         if (localFile != null) return localFile.toURI().toString()
-        return "$normalizedBaseUrl${track.key}"
+        return if (track.key.startsWith("http://") || track.key.startsWith("https://")) {
+            track.key
+        } else {
+            "$normalizedBaseUrl${track.key}"
+        }
     }
 
     fun playTrack(track: TrackItem, queueList: List<TrackItem>) {
