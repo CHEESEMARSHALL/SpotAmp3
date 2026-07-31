@@ -39,6 +39,7 @@ class LibrarySyncWorker(
 
         val pageSize = 500
         var offset = initialOffset
+        var previousPageSignature: String? = null
         
         try {
             val service = if (!useCompanion) PlexClientManager.getApiService(settings.baseUrl) else null
@@ -52,6 +53,19 @@ class LibrarySyncWorker(
                 val backendTracks = companionPage?.tracks.orEmpty()
 
                 if (page.isEmpty() && backendTracks.isEmpty()) break
+
+                val receivedCount = if (useCompanion) backendTracks.size else page.size
+                val pageSignature = if (useCompanion) {
+                    backendTracks.take(10).joinToString("|") { it.id }
+                } else {
+                    page.take(10).joinToString("|") { it.ratingKey }
+                }
+                // A faulty/paginated backend must not leave WorkManager in an
+                // endless loop (and keep the app looking permanently frozen).
+                if (receivedCount == 0 || pageSignature == previousPageSignature) {
+                    throw IllegalStateException("Library sync made no paging progress at offset $offset")
+                }
+                previousPageSignature = pageSignature
 
                 val totalTracks = plexPage?.mediaContainer?.totalSize ?: 0
 
@@ -69,11 +83,11 @@ class LibrarySyncWorker(
 
                 musicDao.insertCachedTracks(entities)
                 
-                offset += if (useCompanion) backendTracks.size else page.size
+                offset += receivedCount
                 syncState = syncState.copy(currentOffset = offset, totalTracks = totalTracks)
                 musicDao.insertSyncState(syncState)
                 
-                if ((if (useCompanion) backendTracks.size else page.size) < pageSize) break
+                if (receivedCount < pageSize) break
             }
             
             musicDao.deleteStaleTracks(syncId)

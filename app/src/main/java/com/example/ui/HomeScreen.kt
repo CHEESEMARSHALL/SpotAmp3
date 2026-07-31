@@ -241,6 +241,7 @@ fun HomeScreen(
                     item {
                         MadeForYouSection(
                             madeForYou = homeFeedState.madeForYou,
+                            source = homeFeedState.source,
                             baseUrl = baseUrl,
                             token = token,
                             onPlayClick = { mfyItem ->
@@ -1763,13 +1764,14 @@ fun PremiumStationTile(
 @Composable
 fun MadeForYouSection(
     madeForYou: List<MadeForYouItem>,
+    source: HomeFeedSource = HomeFeedSource.PLEX,
     baseUrl: String,
     token: String,
     onPlayClick: (MadeForYouItem) -> Unit,
     onAddQueueClick: (MadeForYouItem) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        SectionHeader(title = "Made For You")
+        SectionHeader(title = if (source == HomeFeedSource.SPOTCORE) "SpotCore discovery" else "Made For You")
         LazyRow(
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(16.dp)

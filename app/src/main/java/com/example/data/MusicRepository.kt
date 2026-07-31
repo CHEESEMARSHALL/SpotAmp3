@@ -7,6 +7,7 @@ import com.example.playback.TrackItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.withContext
 import okhttp3.Request
 import java.io.File
@@ -29,7 +30,11 @@ class MusicRepository(private val context: Context) {
     val recentlyPlayed: Flow<List<RecentTrack>> = musicDao.getRecentlyPlayed()
 
     // Flow for cached tracks count (to see if indexed)
+    // A sync inserts a page at a time.  Do not make Compose reload the entire
+    // library for every page; large libraries otherwise spend the whole sync
+    // repeatedly materializing and recomposing the same list.
     val cachedTracksCount: Flow<List<CachedTrack>> = musicDao.getAllCachedTracks()
+        .debounce(750)
 
     fun getSyncStateFlow(sectionId: String): Flow<SyncStateEntity?> {
         return musicDao.getSyncStateFlow(sectionId)
