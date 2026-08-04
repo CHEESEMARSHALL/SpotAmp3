@@ -38,6 +38,8 @@ fun SettingsScreen(
     val downloadedTracks by viewModel.downloadedTracks.collectAsStateWithLifecycle()
     val queue by viewModel.playbackManager.queue.collectAsStateWithLifecycle()
     val activeTheme by viewModel.activeThemeFlow.collectAsStateWithLifecycle()
+    val companionConfigured by viewModel.companionConfigured.collectAsStateWithLifecycle()
+    val primaryBackendName = if (companionConfigured) "SpotCore" else "Plex"
     
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
     val syncState by viewModel.syncState.collectAsStateWithLifecycle()
@@ -99,7 +101,15 @@ fun SettingsScreen(
                     Text("Device Readiness", color = MaterialTheme.colorScheme.onSurface, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
                 }
                 Spacer(Modifier.height(12.dp))
-                DiagnosticRow("Plex connection", if (isConfigured) "Configured" else "Not configured", isConfigured)
+                DiagnosticRow(
+                    "Music backend",
+                    when {
+                        companionConfigured -> "SpotCore connected"
+                        isConfigured -> "Plex connected"
+                        else -> "Not configured"
+                    },
+                    isConfigured
+                )
                 DiagnosticRow("Active library", selectedLibraryName.ifBlank { "Not selected" }, selectedSectionId.isNotBlank())
                 DiagnosticRow("Local index", if (cachedCount > 0) "$cachedCount tracks" else "Empty", cachedCount > 0)
                 DiagnosticRow("Offline downloads", "${downloadedTracks.count { it.status == "completed" }} ready", downloadedTracks.any { it.status == "completed" })
@@ -107,7 +117,7 @@ fun SettingsScreen(
                 DiagnosticRow("Background playback", "Media service enabled", true)
                 DiagnosticRow("AI provider", viewModel.repository.settings.aiProvider.removeSuffix("Provider"), true)
                 Text(
-                    "Diagnostics never display Plex tokens or secret values. Physical-device checks still required for Bluetooth, lock-screen controls, and battery optimization.",
+                    "Diagnostics never display server tokens or secret values. Physical-device checks still required for Bluetooth, lock-screen controls, and battery optimization.",
                     color = Color.White.copy(alpha = 0.45f),
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 10.dp)
@@ -129,8 +139,8 @@ fun SettingsScreen(
                 }
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    if (cleanupSuggestions.isEmpty()) "No obvious metadata issues found in the local Plex cache."
-                    else "${cleanupSuggestions.size} review-only suggestions found in cached Plex metadata.",
+                    if (cleanupSuggestions.isEmpty()) "No obvious metadata issues found in the local library cache."
+                    else "${cleanupSuggestions.size} review-only suggestions found in cached library metadata.",
                     color = Color.White.copy(alpha = 0.65f),
                     style = MaterialTheme.typography.bodySmall
                 )
@@ -143,7 +153,7 @@ fun SettingsScreen(
                     )
                 }
                 Text(
-                    "Suggestions are review-only; SpotAmp never edits Plex metadata automatically.",
+                    "Suggestions are review-only; SpotAmp never edits server metadata automatically.",
                     color = Color.White.copy(alpha = 0.4f),
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 8.dp)
@@ -160,16 +170,16 @@ fun SettingsScreen(
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("Collection Ideas", color = Color.White, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
-                    Text("Review-only groups derived from real Plex metadata.", color = Color.White.copy(alpha = 0.6f), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
+                    Text("Review-only groups derived from your local library metadata.", color = Color.White.copy(alpha = 0.6f), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
                     collectionSuggestions.take(5).forEach { suggestion ->
                         Text("${suggestion.name} · ${suggestion.ratingKeys.size} tracks", color = Color(0xFF818CF8), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 6.dp))
                     }
-                    Text("SpotAmp will not create or edit Plex collections automatically.", color = Color.White.copy(alpha = 0.4f), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
+                    Text("SpotAmp will not create or edit server collections automatically.", color = Color.White.copy(alpha = 0.4f), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
                 }
             }
         }
 
-        // Plex Server Configuration Card
+        // Backend configuration cards
         val isLightTheme = activeTheme == "Warm Light"
         val labelColor = if (isLightTheme) MaterialTheme.colorScheme.onSurface else Color.White
         val subLabelColor = if (isLightTheme) MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f) else Color.White.copy(alpha = 0.8f)
@@ -210,9 +220,9 @@ fun SettingsScreen(
                         )
                         Text(
                             text = if (viewModel.repository.settings.isCompanionConfigured) {
-                                "Analysis-powered Home is enabled"
+                                "Primary backend for Home, library sync, playback, and artwork"
                             } else {
-                                "Optional • Plex remains the fallback"
+                                "Recommended • Plex remains an optional fallback"
                             },
                             style = MaterialTheme.typography.bodySmall,
                             color = subLabelColor
@@ -307,12 +317,12 @@ fun SettingsScreen(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         imageVector = Icons.Rounded.CloudQueue,
-                        contentDescription = "Plex Connection",
+                        contentDescription = "Optional Plex fallback",
                         tint = MaterialTheme.colorScheme.primary
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     Text(
-                        text = "Plex Media Server Settings",
+                        text = "Optional Plex Fallback",
                         style = MaterialTheme.typography.titleMedium.copy(
                             fontWeight = FontWeight.Bold,
                             color = labelColor
@@ -321,6 +331,16 @@ fun SettingsScreen(
                 }
 
                 Spacer(modifier = Modifier.height(18.dp))
+
+                Text(
+                    text = if (companionConfigured) {
+                        "SpotCore is the active backend. Keep Plex configured only for legacy fallback or Plex-hosted lyrics."
+                    } else {
+                        "Use Plex here only when SpotCore is unavailable. SpotCore is the recommended primary backend."
+                    },
+                    style = MaterialTheme.typography.bodySmall.copy(color = subLabelColor),
+                    modifier = Modifier.padding(bottom = 16.dp)
+                )
 
                 // Server URL Input
                 Text(
@@ -507,7 +527,7 @@ fun SettingsScreen(
                             )
                             Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                "Loading libraries from Plex…",
+                                "Loading libraries from $primaryBackendName…",
                                 color = Color.White.copy(alpha = 0.7f),
                                 style = MaterialTheme.typography.bodyMedium
                             )
@@ -515,9 +535,9 @@ fun SettingsScreen(
                     } else if (libraries.isEmpty()) {
                         Text(
                             if (errorMessage != null) {
-                                "Plex did not return the library list. Check the server connection and try again."
+                                "$primaryBackendName did not return the library list. Check the backend connection and try again."
                             } else {
-                                "No music libraries were returned by Plex. Ensure the server has a Music Section."
+                                "No music libraries were returned by $primaryBackendName. Sync the library and try again."
                             },
                             color = Color.White.copy(alpha = 0.5f),
                             style = MaterialTheme.typography.bodyMedium
@@ -534,7 +554,7 @@ fun SettingsScreen(
                         }
                     } else {
                         Text(
-                            "Choose the active Plex music library to browse and play:",
+                            "Choose the active $primaryBackendName music library to browse and play:",
                             color = Color.White.copy(alpha = 0.6f),
                             style = MaterialTheme.typography.bodySmall,
                             modifier = Modifier.padding(bottom = 12.dp)

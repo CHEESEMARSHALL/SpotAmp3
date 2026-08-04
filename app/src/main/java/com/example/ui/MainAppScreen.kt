@@ -30,7 +30,11 @@ sealed class Screen {
     object Downloads : Screen()
     object Settings : Screen()
     data class ArtistDetail(val id: String, val name: String) : Screen()
-    data class AlbumDetail(val id: String, val name: String) : Screen()
+    data class AlbumDetail(
+        val id: String,
+        val name: String,
+        val seedTracks: List<com.example.playback.TrackItem> = emptyList()
+    ) : Screen()
     data class PlaylistDetail(val id: Int, val name: String) : Screen()
     data class CustomPlaylistDetail(
         val type: String,
@@ -357,6 +361,9 @@ fun MainAppScreen(
                                 onNavigateToSettings = { navigateTo(Screen.Settings) },
                                 onNavigateToArtist = { id, name -> navigateTo(Screen.ArtistDetail(id, name)) },
                                 onNavigateToAlbum = { id, name -> navigateTo(Screen.AlbumDetail(id, name)) },
+                                onNavigateToAlbumWithTracks = { id, name, tracks ->
+                                    navigateTo(Screen.AlbumDetail(id, name, tracks))
+                                },
                                 onNavigateToCustomPlaylist = { type, id, title, desc, tracks, colors ->
                                     navigateTo(Screen.CustomPlaylistDetail(type, id, title, desc, tracks, colors))
                                 }
@@ -392,6 +399,7 @@ fun MainAppScreen(
                             is Screen.AlbumDetail -> AlbumDetailScreen(
                                 albumId = currentScreen.id,
                                 albumName = currentScreen.name,
+                                seedTracks = currentScreen.seedTracks,
                                 viewModel = viewModel,
                                 onBack = { navigateBack() },
                                 onNavigateToArtist = { id, name -> navigateTo(Screen.ArtistDetail(id, name)) }

@@ -27,6 +27,10 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import com.example.data.PlaybackStateEntity
 import com.example.data.ListeningHistoryEntity
+import com.example.data.PendingCompanionPlayEntity
+import com.example.sync.CompanionPlaySyncScheduler
+import com.example.sync.spotCoreTrackId
+import java.util.UUID
 
 @Serializable
 data class TrackItem(
@@ -96,6 +100,7 @@ class PlaybackManager private constructor(private val appContext: Context) {
     // Last.fm Scrobbling support
     private var hasScrobbledCurrent = false
     private var currentTrackCompleted = false
+    private var currentPlayEventId: String? = null
 
     // Equalizer & Audio processing
     private var equalizer: android.media.audiofx.Equalizer? = null
@@ -129,6 +134,9 @@ class PlaybackManager private constructor(private val appContext: Context) {
     fun setCompanionToken(token: String) {
         companionToken = token.trim()
         updateHttpRequestHeaders()
+        if (PlexSettingsManager(appContext).isCompanionConfigured) {
+            CompanionPlaySyncScheduler.enqueue(appContext)
+        }
     }
 
     private fun updateHttpRequestHeaders() {
@@ -142,6 +150,9 @@ class PlaybackManager private constructor(private val appContext: Context) {
     fun setMusicDao(dao: MusicDao) {
         this.musicDao = dao
         coroutineScope.launch { restorePlaybackState() }
+        if (PlexSettingsManager(appContext).isCompanionConfigured) {
+            CompanionPlaySyncScheduler.enqueue(appContext)
+        }
     }
 
     private suspend fun restorePlaybackState() {
@@ -262,7 +273,8 @@ class PlaybackManager private constructor(private val appContext: Context) {
                                 _duration.value = track.duration
                                 saveToRecentlyPlayed(track)
                                 currentTrackCompleted = false
-                                recordListeningEvent(track, completed = false, skipped = false)
+                                currentPlayEventId = UUID.randomUUID().toString()
+                                recordListeningEvent(track, completed = false, skipped = false, playEventId = currentPlayEventId)
                                 
                                 // Reset Last.fm triggers and Notify Now Playing
                                 hasScrobbledCurrent = false
@@ -323,7 +335,7 @@ class PlaybackManager private constructor(private val appContext: Context) {
         }
     }
 
-    private fun recordListeningEvent(track: TrackItem, completed: Boolean, skipped: Boolean) {
+    private fun recordListeningEvent(track: TrackItem, completed: Boolean, skipped: Boolean, playEventId: String? = null) {
         coroutineScope.launch {
             historyMutex.withLock {
                 val dao = musicDao ?: return@withLock
@@ -340,9 +352,21 @@ class PlaybackManager private constructor(private val appContext: Context) {
                     skipCount = (existing?.skipCount ?: 0) + if (skipped) 1 else 0,
                     lastPlayedAt = if (!completed && !skipped) now else existing?.lastPlayedAt,
                     lastCompletedAt = if (completed) now else existing?.lastCompletedAt,
-                    lastSkippedAt = if (skipped) now else existing?.lastSkippedAt
+                        lastSkippedAt = if (skipped) now else existing?.lastSkippedAt
                     )
                 )
+                if (!completed && !skipped) {
+                    track.spotCoreTrackId()?.let { trackId ->
+                        dao.insertPendingCompanionPlay(
+                            PendingCompanionPlayEntity(
+                                eventId = playEventId ?: UUID.randomUUID().toString(),
+                                trackId = trackId,
+                                playedAt = now
+                            )
+                        )
+                        CompanionPlaySyncScheduler.enqueue(appContext)
+                    }
+                }
             }
         }
     }
@@ -790,7 +814,8 @@ class PlaybackManager private constructor(private val appContext: Context) {
                 var lyricsLoaded = false
 
                 // 1. Try to fetch lyrics from Plex Server if online/streaming
-                if (baseUrl.isNotEmpty() && token.isNotEmpty() && track.ratingKey.isNotEmpty()) {
+                val trackUsesCompanionStream = track.key.startsWith("http://") || track.key.startsWith("https://")
+                if (!trackUsesCompanionStream && baseUrl.isNotEmpty() && token.isNotEmpty() && track.ratingKey.isNotEmpty()) {
                     try {
                         val apiService = com.example.data.PlexClientManager.getApiService(baseUrl)
                         val detail = apiService.getMetadataDetail(track.ratingKey, token)

@@ -31,9 +31,12 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.example.data.PlexMedia
 import com.example.data.PlexMetadata
+import com.example.data.PlexPart
 import com.example.data.RadioRequest
 import com.example.data.RadioType
+import com.example.playback.TrackItem
 
 enum class AlbumCategory {
     ALBUMS, SINGLES_EPS, LIVE_ALBUMS, COMPILATIONS
@@ -82,7 +85,7 @@ fun ArtistDetailScreen(
         artistsList.find { it.ratingKey == artistId }
     }
     val artistThumb = currentArtistMetadata?.thumb ?: artistFromList?.thumb
-    val imageUrl = if (!artistThumb.isNullOrEmpty()) "$normalizedBaseUrl$artistThumb" else null
+    val imageUrl = if (!artistThumb.isNullOrEmpty()) resolveArtworkUrl(baseUrl, artistThumb) else null
 
     // Categorized lists
     val albumsList = remember(albums) {
@@ -182,11 +185,7 @@ fun ArtistDetailScreen(
                 ) {
                     if (imageUrl != null) {
                         AsyncImage(
-                            model = ImageRequest.Builder(context)
-                                .data(imageUrl)
-                                .addHeader("X-Plex-Token", token)
-                                .crossfade(true)
-                                .build(),
+                            model = authenticatedArtworkRequest(context, imageUrl, token),
                             contentDescription = artistName,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
@@ -464,7 +463,8 @@ fun ArtistDetailScreen(
                                     album = track.parentTitle ?: "Popular Tracks",
                                     key = key,
                                     thumb = track.thumb ?: "",
-                                    duration = track.duration ?: 0L
+                                    duration = track.duration ?: 0L,
+                                    albumRatingKey = track.parentRatingKey
                                 )
                                 viewModel.toggleLikeTrack(trackItem)
                             },
@@ -488,7 +488,8 @@ fun ArtistDetailScreen(
                                     album = track.parentTitle ?: "Popular Tracks",
                                     key = key,
                                     thumb = track.thumb ?: "",
-                                    duration = track.duration ?: 0L
+                                    duration = track.duration ?: 0L,
+                                    albumRatingKey = track.parentRatingKey
                                 )
                             },
                             modifier = Modifier.size(36.dp)
@@ -817,7 +818,7 @@ fun ArtistAlbumListItem(
     modifier: Modifier = Modifier
 ) {
     val albumThumb = album.thumb
-    val imageUrl = if (!albumThumb.isNullOrEmpty()) "$normalizedBaseUrl$albumThumb" else null
+    val imageUrl = if (!albumThumb.isNullOrEmpty()) resolveArtworkUrl(normalizedBaseUrl, albumThumb) else null
     val stars = if (album.title.contains("POST HUMAN: NeX GEn", ignoreCase = true)) " ★★★★★" else ""
 
     Row(
@@ -833,11 +834,7 @@ fun ArtistAlbumListItem(
         ) {
             if (imageUrl != null) {
                 AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(imageUrl)
-                        .addHeader("X-Plex-Token", token)
-                        .crossfade(true)
-                        .build(),
+                    model = authenticatedArtworkRequest(context, imageUrl, token),
                     contentDescription = album.title,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -912,12 +909,30 @@ fun ArtistAlbumListItem(
 fun AlbumDetailScreen(
     albumId: String,
     albumName: String,
+    seedTracks: List<TrackItem> = emptyList(),
     viewModel: MusicViewModel,
     onBack: () -> Unit,
     onNavigateToArtist: (String, String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val tracks by viewModel.currentAlbumTracks.collectAsStateWithLifecycle()
+    val loadedTracks by viewModel.currentAlbumTracks.collectAsStateWithLifecycle()
+    val seededTrackMetadata = remember(albumId, seedTracks) {
+        seedTracks.map { track ->
+            PlexMetadata(
+                ratingKey = track.ratingKey,
+                key = track.key,
+                title = track.title,
+                type = "track",
+                thumb = track.thumb.takeIf(String::isNotBlank),
+                parentTitle = track.album,
+                grandparentTitle = track.artist,
+                duration = track.duration,
+                media = listOf(PlexMedia(listOf(PlexPart(track.key)))),
+                parentRatingKey = track.albumRatingKey
+            )
+        }
+    }
+    val tracks = if (loadedTracks.isNotEmpty()) loadedTracks else seededTrackMetadata
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
@@ -934,7 +949,7 @@ fun AlbumDetailScreen(
     // Find first track's thumbnail as album art, or use album's own
     val firstTrackThumb = tracks.firstOrNull()?.thumb
     val thumbPath = if (!firstTrackThumb.isNullOrEmpty()) firstTrackThumb else null
-    val imageUrl = if (thumbPath != null) "$normalizedBaseUrl$thumbPath" else null
+    val imageUrl = if (thumbPath != null) resolveArtworkUrl(baseUrl, thumbPath) else null
 
     Column(
         modifier = modifier
@@ -1003,11 +1018,7 @@ fun AlbumDetailScreen(
                     // Background ambient blur if artwork exists
                     if (imageUrl != null) {
                         AsyncImage(
-                            model = ImageRequest.Builder(context)
-                                .data(imageUrl)
-                                .addHeader("X-Plex-Token", token)
-                                .crossfade(true)
-                                .build(),
+                            model = authenticatedArtworkRequest(context, imageUrl, token),
                             contentDescription = null,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier
@@ -1050,11 +1061,7 @@ fun AlbumDetailScreen(
                         ) {
                             if (imageUrl != null) {
                                 AsyncImage(
-                                    model = ImageRequest.Builder(context)
-                                    .data(imageUrl)
-                                    .addHeader("X-Plex-Token", token)
-                                        .crossfade(true)
-                                        .build(),
+                                    model = authenticatedArtworkRequest(context, imageUrl, token),
                                     contentDescription = albumName,
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier.fillMaxSize()
@@ -1226,7 +1233,8 @@ fun AlbumDetailScreen(
                                 album = albumName,
                                 key = key,
                                 thumb = track.thumb ?: "",
-                                duration = track.duration ?: 0L
+                                duration = track.duration ?: 0L,
+                                albumRatingKey = albumId
                             )
                         },
                         onClick = {

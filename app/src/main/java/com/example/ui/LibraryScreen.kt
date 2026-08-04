@@ -31,6 +31,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.example.data.PlexMetadata
+import com.example.data.albumNavigationKey
 import com.example.playback.TrackItem
 
 enum class ViewMode { Grid, List }
@@ -62,6 +63,7 @@ fun LibraryScreen(
             .toSet()
     }
     val cachedTracks by viewModel.cachedTracks.collectAsStateWithLifecycle()
+    val currentTrack by viewModel.playbackManager.currentTrack.collectAsStateWithLifecycle()
 
     var selectedTab by remember { mutableIntStateOf(0) }
     var offlineOnly by remember { mutableStateOf(viewModel.repository.settings.offlineOnly) }
@@ -334,8 +336,20 @@ fun LibraryScreen(
                                         track = track,
                                         baseUrl = viewModel.repository.settings.baseUrl,
                                         token = viewModel.repository.settings.token,
-                                        onMoreClick = { /* TODO */ },
-                                        onClick = { viewModel.playTrackFromCache(track) }
+                                        onMoreClick = {
+                                            activeContextMenu = ContextMenuItem.Track(
+                                                ratingKey = track.ratingKey,
+                                                title = track.title,
+                                                artist = track.artist,
+                                                album = track.album,
+                                                key = track.key,
+                                                thumb = track.thumb,
+                                                duration = track.duration,
+                                                albumRatingKey = albumNavigationKey(track.artist, track.album)
+                                            )
+                                        },
+                                        onClick = { viewModel.playTrackFromCache(track) },
+                                        isPlaying = currentTrack?.ratingKey == track.ratingKey
                                     )
                                 }
                             }
@@ -667,7 +681,7 @@ fun ArtistGridItem(
 ) {
     val context = LocalContext.current
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (!artist.thumb.isNullOrEmpty()) "$normalizedBaseUrl${artist.thumb}" else null
+    val imageUrl = if (!artist.thumb.isNullOrEmpty()) resolveArtworkUrl(baseUrl, artist.thumb) else null
 
     Card(
         modifier = Modifier
@@ -696,11 +710,7 @@ fun ArtistGridItem(
                 ) {
                     if (imageUrl != null) {
                         AsyncImage(
-                            model = ImageRequest.Builder(context)
-                                .data(imageUrl)
-                                .addHeader("X-Plex-Token", token)
-                                .crossfade(true)
-                                .build(),
+                            model = authenticatedArtworkRequest(context, imageUrl, token),
                             contentDescription = artist.title,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()

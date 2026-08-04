@@ -26,6 +26,7 @@ import coil.request.ImageRequest
 import com.example.data.PlaylistEntity
 import com.example.data.RadioRequest
 import com.example.data.RadioType
+import com.example.data.albumNavigationKey
 import com.example.playback.TrackItem
 import kotlinx.coroutines.launch
 
@@ -56,7 +57,8 @@ sealed class ContextMenuItem {
         val ratingKey: String,
         val title: String,
         val artist: String,
-        val thumb: String
+        val thumb: String,
+        val tracks: List<TrackItem> = emptyList()
     ) : ContextMenuItem()
 
     data class Artist(
@@ -73,7 +75,10 @@ fun MusicContextMenu(
     viewModel: MusicViewModel,
     onDismiss: () -> Unit,
     onNavigateToArtist: (String, String) -> Unit,
-    onNavigateToAlbum: (String, String) -> Unit
+    onNavigateToAlbum: (String, String) -> Unit,
+    onNavigateToAlbumWithTracks: (String, String, List<TrackItem>) -> Unit = { id, name, _ ->
+        onNavigateToAlbum(id, name)
+    }
 ) {
     val coroutineScope = rememberCoroutineScope()
     val playlists by viewModel.playlists.collectAsState()
@@ -92,7 +97,24 @@ fun MusicContextMenu(
         is ContextMenuItem.Album -> item.thumb
         is ContextMenuItem.Artist -> item.thumb
     }
-    val imageUrl = if (thumb.isNotEmpty()) "$normalizedBaseUrl$thumb" else null
+    val imageUrl = if (thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, thumb) else null
+
+    suspend fun albumTrackItems(album: ContextMenuItem.Album): List<TrackItem> {
+        if (album.tracks.isNotEmpty()) return album.tracks
+        return viewModel.repository.getAlbumTracks(album.ratingKey).mapNotNull { track ->
+            val key = track.media?.firstOrNull()?.part?.firstOrNull()?.key ?: return@mapNotNull null
+            TrackItem(
+                ratingKey = track.ratingKey,
+                title = track.title,
+                artist = track.grandparentTitle ?: track.parentTitle ?: album.artist,
+                album = track.parentTitle ?: album.title,
+                key = key,
+                thumb = track.thumb ?: album.thumb,
+                duration = track.duration ?: 0L,
+                albumRatingKey = album.ratingKey
+            )
+        }
+    }
 
     val title = when (item) {
         is ContextMenuItem.Track -> item.title
@@ -131,11 +153,7 @@ fun MusicContextMenu(
                 ) {
                     if (imageUrl != null) {
                         AsyncImage(
-                            model = ImageRequest.Builder(context)
-                                .data(imageUrl)
-                                .addHeader("X-Plex-Token", token)
-                                .crossfade(true)
-                                .build(),
+                            model = authenticatedArtworkRequest(context, imageUrl, token),
                             contentDescription = title,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
@@ -203,11 +221,7 @@ fun MusicContextMenu(
                                     viewModel.playbackManager.playTrack(item.toTrackItem(), listOf(item.toTrackItem()))
                                 }
                                 is ContextMenuItem.Album -> {
-                                    val tracks = viewModel.repository.getAlbumTracks(item.ratingKey)
-                                    val mapped = tracks.mapNotNull { t ->
-                                        val key = t.media?.firstOrNull()?.part?.firstOrNull()?.key ?: return@mapNotNull null
-                                        TrackItem(t.ratingKey, t.title, t.grandparentTitle ?: t.parentTitle ?: "Unknown", t.parentTitle ?: "Unknown", key, t.thumb ?: "", t.duration ?: 0L)
-                                    }
+                                    val mapped = albumTrackItems(item)
                                     if (mapped.isNotEmpty()) {
                                         viewModel.playbackManager.playQueue(mapped, 0)
                                     }
@@ -242,13 +256,7 @@ fun MusicContextMenu(
                         coroutineScope.launch {
                             val allTracks = when (item) {
                                 is ContextMenuItem.Track -> listOf(item.toTrackItem())
-                                is ContextMenuItem.Album -> {
-                                    val tracks = viewModel.repository.getAlbumTracks(item.ratingKey)
-                                    tracks.mapNotNull { t ->
-                                        val key = t.media?.firstOrNull()?.part?.firstOrNull()?.key ?: return@mapNotNull null
-                                        TrackItem(t.ratingKey, t.title, t.grandparentTitle ?: t.parentTitle ?: "Unknown", t.parentTitle ?: "Unknown", key, t.thumb ?: "", t.duration ?: 0L)
-                                    }
-                                }
+                                is ContextMenuItem.Album -> albumTrackItems(item)
                                 is ContextMenuItem.Artist -> {
                                     val albums = viewModel.repository.getArtistAlbums(item.ratingKey)
                                     val list = mutableListOf<TrackItem>()
@@ -313,11 +321,7 @@ fun MusicContextMenu(
                                     viewModel.playbackManager.playNext(item.toTrackItem())
                                 }
                                 is ContextMenuItem.Album -> {
-                                    val tracks = viewModel.repository.getAlbumTracks(item.ratingKey)
-                                    val mapped = tracks.mapNotNull { t ->
-                                        val key = t.media?.firstOrNull()?.part?.firstOrNull()?.key ?: return@mapNotNull null
-                                        TrackItem(t.ratingKey, t.title, t.grandparentTitle ?: t.parentTitle ?: "Unknown", t.parentTitle ?: "Unknown", key, t.thumb ?: "", t.duration ?: 0L)
-                                    }
+                                    val mapped = albumTrackItems(item)
                                     viewModel.playbackManager.playTracksNext(mapped)
                                 }
                                 is ContextMenuItem.Artist -> {
@@ -351,11 +355,7 @@ fun MusicContextMenu(
                                     viewModel.playbackManager.addToQueue(item.toTrackItem())
                                 }
                                 is ContextMenuItem.Album -> {
-                                    val tracks = viewModel.repository.getAlbumTracks(item.ratingKey)
-                                    val mapped = tracks.mapNotNull { t ->
-                                        val key = t.media?.firstOrNull()?.part?.firstOrNull()?.key ?: return@mapNotNull null
-                                        TrackItem(t.ratingKey, t.title, t.grandparentTitle ?: t.parentTitle ?: "Unknown", t.parentTitle ?: "Unknown", key, t.thumb ?: "", t.duration ?: 0L)
-                                    }
+                                    val mapped = albumTrackItems(item)
                                     viewModel.playbackManager.addTracksToQueue(mapped)
                                 }
                                 is ContextMenuItem.Artist -> {
@@ -398,7 +398,11 @@ fun MusicContextMenu(
                                 coroutineScope.launch {
                                     // Plex track details usually have parents, but to be simple and accurate, we find the track metadata
                                     // Since Plex track lists have parentRatingKey, let's navigate to the album
-                                    onNavigateToAlbum(item.albumRatingKey ?: item.ratingKey, item.album)
+                                    onNavigateToAlbumWithTracks(
+                                        item.albumRatingKey ?: albumNavigationKey(item.artist, item.album),
+                                        item.album,
+                                        listOf(item.toTrackItem())
+                                    )
                                     onDismiss()
                                 }
                             }

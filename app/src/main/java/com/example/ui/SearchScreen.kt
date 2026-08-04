@@ -41,6 +41,7 @@ fun SearchScreen(
     val searchError by viewModel.searchError.collectAsStateWithLifecycle()
     val isConfigured by viewModel.isConfigured.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+    val currentTrack by viewModel.playbackManager.currentTrack.collectAsStateWithLifecycle()
     val downloadedTracks by viewModel.downloadedTracks.collectAsStateWithLifecycle()
     val downloadedKeys = remember(downloadedTracks) {
         downloadedTracks.filter { it.status == "completed" && !it.localPath.isNullOrBlank() }
@@ -283,6 +284,7 @@ fun SearchScreen(
                             baseUrl = viewModel.repository.settings.baseUrl,
                             token = viewModel.repository.settings.token,
                             isDownloaded = track.ratingKey in downloadedKeys,
+                            isPlaying = currentTrack?.ratingKey == track.ratingKey,
                             onMoreClick = {
                                 activeContextMenu = ContextMenuItem.Track(
                                     ratingKey = track.ratingKey,
@@ -291,7 +293,8 @@ fun SearchScreen(
                                     album = track.parentTitle ?: "Unknown Album",
                                     key = key,
                                     thumb = track.thumb ?: "",
-                                    duration = track.duration ?: 0L
+                                    duration = track.duration ?: 0L,
+                                    albumRatingKey = track.parentRatingKey
                                 )
                             }
                         ) {
@@ -337,32 +340,31 @@ fun SearchItemRow(
     baseUrl: String,
     token: String,
     isDownloaded: Boolean = false,
+    isPlaying: Boolean = false,
     onMoreClick: () -> Unit,
     onClick: () -> Unit
 ) {
     val context = LocalContext.current
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (!thumb.isNullOrEmpty()) "$normalizedBaseUrl$thumb" else null
+    val imageUrl = if (!thumb.isNullOrEmpty()) resolveArtworkUrl(baseUrl, thumb) else null
+    val activeColor = MaterialTheme.colorScheme.primary
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (isPlaying) activeColor.copy(alpha = 0.15f) else Color.Transparent)
             .clickable { onClick() }
-            .padding(8.dp),
+            .padding(vertical = 5.dp, horizontal = 6.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Card(
-            modifier = Modifier.size(52.dp),
+            modifier = Modifier.size(48.dp),
             shape = RoundedCornerShape(if (isCircle) 26.dp else 12.dp)
         ) {
             if (imageUrl != null) {
                 AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(imageUrl)
-                        .addHeader("X-Plex-Token", token)
-                        .crossfade(true)
-                        .build(),
+                    model = authenticatedArtworkRequest(context, imageUrl, token),
                     contentDescription = title,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -388,14 +390,14 @@ fun SearchItemRow(
             }
         }
 
-        Spacer(modifier = Modifier.width(16.dp))
+        Spacer(modifier = Modifier.width(12.dp))
 
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 text = title,
                 style = MaterialTheme.typography.bodyLarge.copy(
                     fontWeight = FontWeight.Bold,
-                    color = Color.White
+                    color = if (isPlaying) activeColor else Color.White
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -412,7 +414,7 @@ fun SearchItemRow(
 
         IconButton(
             onClick = { onMoreClick() },
-            modifier = Modifier.size(40.dp)
+            modifier = Modifier.size(34.dp)
         ) {
             Icon(
                 imageVector = Icons.Rounded.MoreVert,

@@ -1,8 +1,10 @@
 package com.example.ui
 
 import androidx.compose.animation.*
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
@@ -36,6 +38,15 @@ import com.example.data.*
 import com.example.playback.TrackItem
 import kotlinx.coroutines.launch
 
+@OptIn(ExperimentalFoundationApi::class)
+private fun Modifier.homeTileGesture(
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
+): Modifier = combinedClickable(
+    onClick = onClick,
+    onLongClick = onLongClick
+)
+
 @Composable
 fun HomeScreen(
     viewModel: MusicViewModel,
@@ -43,6 +54,9 @@ fun HomeScreen(
     onNavigateToArtist: (String, String) -> Unit,
     onNavigateToAlbum: (String, String) -> Unit,
     onNavigateToCustomPlaylist: (String, String, String, String, List<TrackItem>, List<Long>) -> Unit,
+    onNavigateToAlbumWithTracks: (String, String, List<TrackItem>) -> Unit = { id, name, _ ->
+        onNavigateToAlbum(id, name)
+    },
     modifier: Modifier = Modifier
 ) {
     val isConfigured by viewModel.isConfigured.collectAsStateWithLifecycle()
@@ -104,7 +118,7 @@ fun HomeScreen(
                 }
             }
 
-            // Connection Check Banner (if Plex/Backend URL is unconfigured)
+            // Connection Check Banner (if no backend is configured)
             if (!isConfigured) {
                 item {
                     UnconfiguredBanner(onNavigateToSettings = onNavigateToSettings)
@@ -148,7 +162,8 @@ fun HomeScreen(
                                         album = track.album,
                                         key = track.key,
                                         thumb = track.thumb,
-                                        duration = track.duration
+                                        duration = track.duration,
+                                        albumRatingKey = track.albumRatingKey
                                     )
                                 }
                             }
@@ -164,7 +179,21 @@ fun HomeScreen(
                             baseUrl = baseUrl,
                             token = token,
                             onAlbumClick = { album ->
-                                onNavigateToAlbum(album.ratingKey, album.title)
+                                val attachedAlbum = homeFeedState.albumShelves
+                                    .asSequence()
+                                    .flatMap { it.albums.asSequence() }
+                                    .firstOrNull {
+                                        it.title == album.title && it.artist == (album.parentTitle ?: "Various Artists")
+                                    }
+                                if (attachedAlbum != null) {
+                                    onNavigateToAlbumWithTracks(
+                                        attachedAlbum.id,
+                                        attachedAlbum.title,
+                                        attachedAlbum.tracks
+                                    )
+                                } else {
+                                    onNavigateToAlbum(album.ratingKey, album.title)
+                                }
                             },
                             onMoreClick = { album ->
                                 activeContextMenu = ContextMenuItem.Album(
@@ -175,6 +204,32 @@ fun HomeScreen(
                                 )
                             }
                         )
+                    }
+                }
+
+                // Album-first discovery shelves. A tap opens the album detail;
+                // playback stays behind the detail screen's explicit controls.
+                if (homeFeedState.albumShelves.isNotEmpty()) {
+                    homeFeedState.albumShelves.forEach { shelf ->
+                        item {
+                            AlbumRecommendationShelfSection(
+                                shelf = shelf,
+                                baseUrl = baseUrl,
+                                token = token,
+                                onOpenAlbum = { album ->
+                                    onNavigateToAlbumWithTracks(album.id, album.title, album.tracks)
+                                },
+                                onMoreClick = { album ->
+                                    activeContextMenu = ContextMenuItem.Album(
+                                        ratingKey = album.id,
+                                        title = album.title,
+                                        artist = album.artist,
+                                        thumb = album.thumb,
+                                        tracks = album.tracks
+                                    )
+                                }
+                            )
+                        }
                     }
                 }
 
@@ -275,7 +330,8 @@ fun HomeScreen(
                                         album = track.album,
                                         key = track.key,
                                         thumb = track.thumb,
-                                        duration = track.duration
+                                        duration = track.duration,
+                                        albumRatingKey = track.albumRatingKey
                                     )
                                 }
                             )
@@ -301,7 +357,8 @@ fun HomeScreen(
                                     album = trackItem.album,
                                     key = trackItem.key,
                                     thumb = trackItem.thumb,
-                                    duration = trackItem.duration
+                                    duration = trackItem.duration,
+                                    albumRatingKey = trackItem.albumRatingKey
                                 )
                             }
                         )
@@ -332,9 +389,11 @@ fun HomeScreen(
                             baseUrl = baseUrl,
                             token = token,
                             onReleaseClick = { release ->
-                                if (release.tracks.isNotEmpty()) {
-                                    viewModel.playbackManager.playQueue(release.tracks, 0)
-                                }
+                                onNavigateToAlbumWithTracks(
+                                    albumNavigationKey(release.artist, release.title),
+                                    release.title,
+                                    release.tracks
+                                )
                             }
                         )
                     }
@@ -358,7 +417,8 @@ fun HomeScreen(
                                     album = recent.album,
                                     key = recent.key,
                                     thumb = recent.thumb,
-                                    duration = 0L
+                                    duration = 0L,
+                                    albumRatingKey = albumNavigationKey(recent.artist, recent.album)
                                 )
                             }
                         )
@@ -367,6 +427,7 @@ fun HomeScreen(
 
                 if (homeFeedState.recentPlays.isEmpty() &&
                     homeFeedState.recentlyAdded.isEmpty() &&
+                    homeFeedState.albumShelves.isEmpty() &&
                     homeFeedState.dailyMixes.isEmpty() &&
                     homeFeedState.history.isEmpty()
                 ) {
@@ -400,7 +461,7 @@ fun HomeScreen(
                                 station.gradientColors
                             )
                         } else {
-                            viewModel.postErrorMessage("No matching tracks found in your offline Plex cache.")
+                            viewModel.postErrorMessage("No matching tracks found in your offline library cache.")
                         }
                     }
                 }
@@ -414,7 +475,8 @@ fun HomeScreen(
                 viewModel = viewModel,
                 onDismiss = { activeContextMenu = null },
                 onNavigateToArtist = onNavigateToArtist,
-                onNavigateToAlbum = onNavigateToAlbum
+                onNavigateToAlbum = onNavigateToAlbum,
+                onNavigateToAlbumWithTracks = onNavigateToAlbumWithTracks
             )
         }
 
@@ -490,7 +552,7 @@ private fun HomeEmptyState(
             Text(
                 text = when {
                     !isConfigured && hasCachedMusic -> "Offline library ready"
-                    !isConfigured -> "Connect Plex to get started"
+                    !isConfigured -> "Connect a music backend to get started"
                     else -> "Your library is ready to explore"
                 },
                 color = Color.White,
@@ -500,7 +562,7 @@ private fun HomeEmptyState(
             Text(
                 text = when {
                     !isConfigured && hasCachedMusic -> "No Home shelves are available yet, but your cached music remains searchable offline."
-                    !isConfigured -> "Configure Plex or index music to populate real Home shelves."
+                    !isConfigured -> "Configure SpotCore or Plex, or index music to populate real Home shelves."
                     else -> "Sync your music library to build real recommendations and history."
                 },
                 color = Color.White.copy(alpha = 0.6f),
@@ -536,7 +598,7 @@ private fun HomeErrorBanner(
         ) {
             Icon(Icons.Rounded.ErrorOutline, contentDescription = "Sync error", tint = Color(0xFFFCA5A5))
             Column(modifier = Modifier.weight(1f)) {
-                Text("Plex sync needs attention", color = Color.White, fontWeight = FontWeight.Bold)
+                Text("Library sync needs attention", color = Color.White, fontWeight = FontWeight.Bold)
                 Text(message, color = Color.White.copy(alpha = 0.7f), style = MaterialTheme.typography.bodySmall)
             }
             TextButton(onClick = onNavigateToSettings) { Text("Settings") }
@@ -609,13 +671,13 @@ private fun StationDetailsDialog(
     }
     val selectionExplanation = when {
         selectedArtist != null && station.type == RadioType.ARTIST_RADIO -> "Based on artist: $selectedArtist"
-        selectedGenre != null && station.type in setOf(RadioType.GENRE_RADIO, RadioType.MOOD_RADIO, RadioType.STYLE_RADIO) -> "Based on Plex genre: $selectedGenre"
-        selectedCollection != null && station.type == RadioType.COLLECTION_RADIO -> "Based on Plex collection: $selectedCollection"
+        selectedGenre != null && station.type in setOf(RadioType.GENRE_RADIO, RadioType.MOOD_RADIO, RadioType.STYLE_RADIO) -> "Based on library genre: $selectedGenre"
+        selectedCollection != null && station.type == RadioType.COLLECTION_RADIO -> "Based on library collection: $selectedCollection"
         selectedDecade != null && station.type in setOf(RadioType.DECADE_RADIO, RadioType.TIME_TRAVEL) -> "Based on release decade: $selectedDecade–${selectedDecade!! + 9}"
-        station.type == RadioType.RECENTLY_ADDED_RADIO -> "Ranked by Plex added time"
+        station.type == RadioType.RECENTLY_ADDED_RADIO -> "Ranked by library added time"
         station.type == RadioType.DEEP_CUTS -> "Ranked by lowest play count"
         station.type == RadioType.FORGOTTEN_FAVORITES -> "Played history, excluding recent listens"
-        else -> "Selected from your indexed Plex library"
+        else -> "Selected from your indexed library"
     }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -625,9 +687,9 @@ private fun StationDetailsDialog(
                 Text(station.subtitle, style = MaterialTheme.typography.bodySmall)
                 Text(
                     text = when (matchingTrackCount) {
-                        null -> "Checking cached Plex tracks…"
-                        0 -> "No cached Plex tracks match these selections. Sync your library to refresh metadata."
-                        else -> "$matchingTrackCount matching cached Plex tracks"
+                        null -> "Checking cached library tracks…"
+                        0 -> "No cached library tracks match these selections. Sync your library to refresh metadata."
+                        else -> "$matchingTrackCount matching cached library tracks"
                     },
                     color = if (matchingTrackCount == 0) Color(0xFFFBBF24) else Color.White.copy(alpha = 0.65f),
                     style = MaterialTheme.typography.bodySmall
@@ -674,7 +736,7 @@ private fun StationDetailsDialog(
                 if (station.type == RadioType.ARTIST_RADIO) {
                     Text("Artist")
                     Text(
-                        text = selectedArtist?.let { "Selected: $it" } ?: if (cachedTracks == null) "Loading cached Plex artists…" else "No cached artists available",
+                        text = selectedArtist?.let { "Selected: $it" } ?: if (cachedTracks == null) "Loading cached artists…" else "No cached artists available",
                         color = Color.White.copy(alpha = 0.65f),
                         style = MaterialTheme.typography.bodySmall
                     )
@@ -733,7 +795,7 @@ fun HomeHeader(
                 Text(
                     text = when {
                         source == HomeFeedSource.SPOTCORE -> "SPOTCORE CONNECTED"
-                        isConfigured -> "PLEX CONNECTED"
+                        isConfigured -> "MUSIC BACKEND CONNECTED"
                         else -> "OFFLINE MODE"
                     },
                     style = MaterialTheme.typography.bodySmall.copy(
@@ -744,7 +806,7 @@ fun HomeHeader(
                 )
             }
             Text(
-                text = if (libraryName.isNotEmpty()) libraryName else "Plex Audio Library",
+                text = if (libraryName.isNotEmpty()) libraryName else "Music Library",
                 style = MaterialTheme.typography.headlineMedium.copy(
                     fontWeight = FontWeight.Black,
                     color = Color.White,
@@ -756,7 +818,7 @@ fun HomeHeader(
             Text(
                 text = when {
                     source == HomeFeedSource.SPOTCORE -> "CLAP and taxonomy-powered discovery"
-                    isConfigured -> "Local-first • Plex metadata"
+                    isConfigured -> "Local-first • backend metadata"
                     else -> "Cached music • Offline capable"
                 },
                 style = MaterialTheme.typography.labelSmall.copy(
@@ -946,7 +1008,7 @@ fun UnconfiguredBanner(onNavigateToSettings: () -> Unit) {
                     tint = Color(0xFFFCA5A5)
                 )
                 Text(
-                    text = "Your Plex library is offline",
+                    text = "Your music library is offline",
                     style = MaterialTheme.typography.titleMedium.copy(
                         fontWeight = FontWeight.Bold,
                         color = Color.White
@@ -954,7 +1016,7 @@ fun UnconfiguredBanner(onNavigateToSettings: () -> Unit) {
                 )
             }
             Text(
-                text = "Connect your Plex Media Server in Settings, or index your library to browse cached music while offline.",
+                text = "Connect a music backend in Settings, or index your library to browse cached music while offline.",
                 style = MaterialTheme.typography.bodyMedium.copy(
                     color = Color.White.copy(alpha = 0.7f),
                     lineHeight = 20.sp
@@ -1061,7 +1123,10 @@ fun RecentPlayCard(
     Card(
         modifier = Modifier
             .width(140.dp)
-            .clickable { onPlayClick() },
+            .homeTileGesture(
+                onClick = onPlayClick,
+                onLongClick = onMoreClick
+            ),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.03f)),
         border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.05f))
@@ -1103,23 +1168,6 @@ fun RecentPlayCard(
                             )
                         }
                     }
-                }
-
-                // More Menu Overlay
-                IconButton(
-                    onClick = onMoreClick,
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(4.dp)
-                        .size(24.dp)
-                        .background(Color.Black.copy(alpha = 0.5f), CircleShape)
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.MoreVert,
-                        contentDescription = "More",
-                        tint = Color.White,
-                        modifier = Modifier.size(12.dp)
-                    )
                 }
 
                 // Small relative time tag overlay
@@ -1201,12 +1249,15 @@ fun AlbumCard(
 ) {
     val context = LocalContext.current
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (!album.thumb.isNullOrEmpty()) "$normalizedBaseUrl${album.thumb}" else null
+    val imageUrl = if (!album.thumb.isNullOrEmpty()) resolveArtworkUrl(baseUrl, album.thumb) else null
 
     Column(
         modifier = Modifier
             .width(130.dp)
-            .clickable { onClick() }
+            .homeTileGesture(
+                onClick = onClick,
+                onLongClick = onMoreClick
+            )
     ) {
         Box(
             modifier = Modifier
@@ -1221,11 +1272,7 @@ fun AlbumCard(
             ) {
                 if (imageUrl != null) {
                     AsyncImage(
-                        model = ImageRequest.Builder(context)
-                            .data(imageUrl)
-                            .addHeader("X-Plex-Token", token)
-                            .crossfade(true)
-                            .build(),
+                        model = authenticatedArtworkRequest(context, imageUrl, token),
                         contentDescription = album.title,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
@@ -1249,23 +1296,6 @@ fun AlbumCard(
                         )
                     }
                 }
-            }
-
-            // More Menu overlay
-            IconButton(
-                onClick = onMoreClick,
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(6.dp)
-                    .size(24.dp)
-                    .background(Color.Black.copy(alpha = 0.5f), CircleShape)
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.MoreVert,
-                    contentDescription = "More",
-                    tint = Color.White,
-                    modifier = Modifier.size(12.dp)
-                )
             }
 
             // Small year label if available
@@ -1321,6 +1351,48 @@ fun AlbumCard(
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
+    }
+}
+
+@Composable
+private fun AlbumRecommendationShelfSection(
+    shelf: AlbumRecommendationShelf,
+    baseUrl: String,
+    token: String,
+    onOpenAlbum: (AlbumRecommendation) -> Unit,
+    onMoreClick: (AlbumRecommendation) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        SectionHeader(title = shelf.title)
+        if (shelf.reason.isNotBlank()) {
+            Text(
+                text = shelf.reason,
+                color = Color.White.copy(alpha = 0.52f),
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(horizontal = 16.dp)
+            )
+        }
+        LazyRow(
+            contentPadding = PaddingValues(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            items(shelf.albums, key = { it.id }) { album ->
+                AlbumCard(
+                    album = PlexMetadata(
+                        ratingKey = album.id,
+                        title = album.title,
+                        type = "album",
+                        thumb = album.thumb,
+                        parentTitle = album.artist,
+                        year = album.year
+                    ),
+                    baseUrl = baseUrl,
+                    token = token,
+                    onClick = { onOpenAlbum(album) },
+                    onMoreClick = { onMoreClick(album) }
+                )
+            }
+        }
     }
 }
 
@@ -1505,7 +1577,7 @@ fun JumpBackInCard(
 ) {
     val context = LocalContext.current
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (jbi.thumb.isNotEmpty()) "$normalizedBaseUrl${jbi.thumb}" else null
+    val imageUrl = if (jbi.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, jbi.thumb) else null
 
     Column(
         modifier = Modifier
@@ -1525,11 +1597,7 @@ fun JumpBackInCard(
             ) {
                 if (imageUrl != null) {
                     AsyncImage(
-                        model = ImageRequest.Builder(context)
-                            .data(imageUrl)
-                            .addHeader("X-Plex-Token", token)
-                            .crossfade(true)
-                            .build(),
+                        model = authenticatedArtworkRequest(context, imageUrl, token),
                         contentDescription = jbi.title,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
@@ -1958,12 +2026,15 @@ fun TrackCard(
 ) {
     val context = LocalContext.current
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (track.thumb.isNotEmpty()) "$normalizedBaseUrl${track.thumb}" else null
+    val imageUrl = if (track.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, track.thumb) else null
 
     Column(
         modifier = Modifier
             .width(120.dp)
-            .clickable { onClick() }
+            .homeTileGesture(
+                onClick = onClick,
+                onLongClick = onMoreClick
+            )
     ) {
         Box(
             modifier = Modifier
@@ -1977,11 +2048,7 @@ fun TrackCard(
             ) {
                 if (imageUrl != null) {
                     AsyncImage(
-                        model = ImageRequest.Builder(context)
-                                .data(imageUrl)
-                                .addHeader("X-Plex-Token", token)
-                            .crossfade(true)
-                            .build(),
+                        model = authenticatedArtworkRequest(context, imageUrl, token),
                         contentDescription = track.title,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
@@ -2007,21 +2074,6 @@ fun TrackCard(
                 }
             }
 
-            IconButton(
-                onClick = onMoreClick,
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(6.dp)
-                    .size(24.dp)
-                    .background(Color.Black.copy(alpha = 0.5f), CircleShape)
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.MoreVert,
-                    contentDescription = "More",
-                    tint = Color.White,
-                    modifier = Modifier.size(12.dp)
-                )
-            }
         }
 
         Text(
@@ -2272,7 +2324,7 @@ fun NewReleaseCard(
 ) {
     val context = LocalContext.current
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (release.thumb.isNotEmpty()) "$normalizedBaseUrl${release.thumb}" else null
+    val imageUrl = if (release.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, release.thumb) else null
 
     Column(
         modifier = Modifier
@@ -2291,11 +2343,7 @@ fun NewReleaseCard(
             ) {
                 if (imageUrl != null) {
                     AsyncImage(
-                        model = ImageRequest.Builder(context)
-                            .data(imageUrl)
-                            .addHeader("X-Plex-Token", token)
-                            .crossfade(true)
-                            .build(),
+                        model = authenticatedArtworkRequest(context, imageUrl, token),
                         contentDescription = release.title,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
@@ -2399,12 +2447,15 @@ fun RecentHistoryRow(
 ) {
     val context = LocalContext.current
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (recent.thumb.isNotEmpty()) "$normalizedBaseUrl${recent.thumb}" else null
+    val imageUrl = if (recent.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, recent.thumb) else null
 
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onClick() },
+            .homeTileGesture(
+                onClick = onClick,
+                onLongClick = onMoreClick
+            ),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.02f)),
         border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.04f))
@@ -2421,11 +2472,7 @@ fun RecentHistoryRow(
             ) {
                 if (imageUrl != null) {
                     AsyncImage(
-                        model = ImageRequest.Builder(context)
-                            .data(imageUrl)
-                            .addHeader("X-Plex-Token", token)
-                            .crossfade(true)
-                            .build(),
+                        model = authenticatedArtworkRequest(context, imageUrl, token),
                         contentDescription = recent.title,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
@@ -2469,13 +2516,6 @@ fun RecentHistoryRow(
                 )
             }
 
-            IconButton(onClick = onMoreClick) {
-                Icon(
-                    imageVector = Icons.Rounded.MoreVert,
-                    contentDescription = "More",
-                    tint = Color.White.copy(alpha = 0.6f)
-                )
-            }
         }
     }
 }

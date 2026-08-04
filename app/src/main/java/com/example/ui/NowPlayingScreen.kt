@@ -40,7 +40,7 @@ import com.example.playback.TrackItem
 import com.example.data.LocalDjBlurbService
 
 @Composable
-fun NowPlayingScreen(
+fun LegacyNowPlayingScreen(
     viewModel: MusicViewModel,
     baseUrl: String,
     token: String,
@@ -196,6 +196,7 @@ fun NowPlayingScreen(
                             spectrum = spectrum,
                             waveform = waveform,
                             mode = visualizerMode,
+                            token = token,
                             onModeChange = { visualizerMode = it },
                             onClick = { 
                                 showLyrics = true
@@ -573,7 +574,8 @@ fun NowPlayingScreen(
                     album = trackItem.album,
                     key = trackItem.key,
                     thumb = trackItem.thumb,
-                    duration = trackItem.duration
+                    duration = trackItem.duration,
+                    albumRatingKey = trackItem.albumRatingKey
                 ),
                 viewModel = viewModel,
                 onDismiss = { showContextMenu = false },

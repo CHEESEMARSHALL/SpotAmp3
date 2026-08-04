@@ -25,6 +25,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.example.playback.TrackItem
@@ -42,6 +43,7 @@ fun CustomPlaylistDetailScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val currentTrack by viewModel.playbackManager.currentTrack.collectAsStateWithLifecycle()
     var isSaved by remember { mutableStateOf(false) }
     var isDownloading by remember { mutableStateOf(false) }
 
@@ -52,7 +54,7 @@ fun CustomPlaylistDetailScreen(
     // Find first track's thumbnail as fallback/ambient artwork
     val firstTrackThumb = tracks.firstOrNull()?.thumb
     val thumbPath = if (!firstTrackThumb.isNullOrEmpty()) firstTrackThumb else null
-    val imageUrl = if (thumbPath != null) "$normalizedBaseUrl$thumbPath" else null
+    val imageUrl = if (thumbPath != null) resolveArtworkUrl(baseUrl, thumbPath) else null
 
     val gradientColors = remember(colors) {
         if (colors.isNotEmpty()) {
@@ -115,11 +117,7 @@ fun CustomPlaylistDetailScreen(
                     // Background ambient blur if artwork exists
                     if (imageUrl != null) {
                         AsyncImage(
-                            model = ImageRequest.Builder(context)
-                                .data(imageUrl)
-                                .addHeader("X-Plex-Token", token)
-                                .crossfade(true)
-                                .build(),
+                            model = authenticatedArtworkRequest(context, imageUrl, token),
                             contentDescription = null,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier
@@ -368,7 +366,8 @@ fun CustomPlaylistDetailScreen(
                         track = track,
                         onClick = {
                             viewModel.playbackManager.playTrack(track, tracks)
-                        }
+                        },
+                        isPlaying = currentTrack?.ratingKey == track.ratingKey
                     )
                 }
             }
@@ -385,13 +384,17 @@ fun CustomPlaylistDetailScreen(
 fun CustomTrackRow(
     index: Int,
     track: TrackItem,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    isPlaying: Boolean = false
 ) {
+    val activeColor = MaterialTheme.colorScheme.primary
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(if (isPlaying) activeColor.copy(alpha = 0.15f) else Color.Transparent)
             .clickable { onClick() }
-            .padding(vertical = 12.dp, horizontal = 16.dp),
+            .padding(vertical = 6.dp, horizontal = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         // Track Index Number
@@ -413,7 +416,7 @@ fun CustomTrackRow(
                 text = track.title,
                 style = MaterialTheme.typography.bodyLarge.copy(
                     fontWeight = FontWeight.Bold,
-                    color = Color.White
+                color = if (isPlaying) activeColor else Color.White
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis

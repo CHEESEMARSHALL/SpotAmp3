@@ -280,13 +280,9 @@ fun ArtistGridItem(
     onClick: () -> Unit
 ) {
     val context = LocalContext.current
-    val imageRequest = remember(artist.thumb) {
+    val imageRequest = remember(artist.thumb, normalizedBaseUrl, token) {
         if (artist.thumb.isNotEmpty()) {
-            ImageRequest.Builder(context)
-                .data("$normalizedBaseUrl${artist.thumb}")
-                .addHeader("X-Plex-Token", token)
-                .crossfade(true)
-                .build()
+            authenticatedArtworkRequest(context, resolveArtworkUrl(normalizedBaseUrl, artist.thumb), token)
         } else null
     }
 
@@ -619,13 +615,9 @@ fun AlbumGridItem(
     onClick: () -> Unit
 ) {
     val context = LocalContext.current
-    val imageRequest = remember(album.thumb) {
+    val imageRequest = remember(album.thumb, normalizedBaseUrl, token) {
         if (album.thumb.isNotEmpty()) {
-            ImageRequest.Builder(context)
-                .data("$normalizedBaseUrl${album.thumb}")
-                .addHeader("X-Plex-Token", token)
-                .crossfade(true)
-                .build()
+            authenticatedArtworkRequest(context, resolveArtworkUrl(normalizedBaseUrl, album.thumb), token)
         } else null
     }
 

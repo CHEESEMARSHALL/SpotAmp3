@@ -234,6 +234,9 @@ class MusicRepository(private val context: Context) {
     }
 
     suspend fun getArtists(sectionId: String): List<PlexMetadata> = withContext(Dispatchers.IO) {
+        if (settings.isCompanionConfigured && sectionId == "spotcore") {
+            return@withContext getCachedArtists()
+        }
         try {
             val response = getService().getLibraryItems(sectionId, "8", token = settings.token)
             response.mediaContainer.metadata ?: emptyList()
@@ -244,6 +247,9 @@ class MusicRepository(private val context: Context) {
     }
 
     suspend fun getAlbums(sectionId: String): List<PlexMetadata> = withContext(Dispatchers.IO) {
+        if (settings.isCompanionConfigured && sectionId == "spotcore") {
+            return@withContext getCachedAlbums()
+        }
         try {
             val response = getService().getLibraryItems(sectionId, "9", token = settings.token)
             response.mediaContainer.metadata ?: emptyList()
@@ -254,6 +260,9 @@ class MusicRepository(private val context: Context) {
     }
 
     suspend fun getRecentlyAddedAlbums(sectionId: String): List<PlexMetadata> = withContext(Dispatchers.IO) {
+        if (settings.isCompanionConfigured && sectionId == "spotcore") {
+            return@withContext getCachedAlbums().sortedByDescending { it.addedAt ?: 0L }
+        }
         try {
             val response = getService().getRecentlyAddedAlbums(sectionId, "9", settings.token)
             response.mediaContainer.metadata ?: emptyList()
@@ -264,6 +273,21 @@ class MusicRepository(private val context: Context) {
     }
 
     suspend fun getMetadataDetail(ratingKey: String): PlexMetadata? = withContext(Dispatchers.IO) {
+        if (settings.isCompanionConfigured) {
+            musicDao.getCachedTracksList().firstOrNull { it.ratingKey == ratingKey }?.let {
+                return@withContext it.toPlexMetadata()
+            }
+            when {
+                ratingKey.startsWith("spotcore-artist:") -> {
+                    val artist = ratingKey.removePrefix("spotcore-artist:")
+                    return@withContext getCachedArtists().firstOrNull { it.title == artist }
+                }
+                parseAlbumNavigationKey(ratingKey) != null -> {
+                    val (artist, album) = parseAlbumNavigationKey(ratingKey) ?: return@withContext null
+                    return@withContext getCachedAlbums().firstOrNull { it.title == album && it.parentTitle == artist }
+                }
+            }
+        }
         try {
             val response = getService().getMetadataDetail(ratingKey, settings.token)
             response.mediaContainer.metadata?.firstOrNull()
@@ -274,6 +298,10 @@ class MusicRepository(private val context: Context) {
     }
 
     suspend fun getArtistAlbums(artistId: String): List<PlexMetadata> = withContext(Dispatchers.IO) {
+        if (settings.isCompanionConfigured && artistId.startsWith("spotcore-artist:")) {
+            val artist = artistId.removePrefix("spotcore-artist:")
+            return@withContext getCachedAlbums().filter { it.parentTitle == artist }
+        }
         try {
             val response = getService().getChildren(artistId, settings.token)
             response.mediaContainer.metadata ?: emptyList()
@@ -284,6 +312,11 @@ class MusicRepository(private val context: Context) {
     }
 
     suspend fun getAlbumTracks(albumId: String): List<PlexMetadata> = withContext(Dispatchers.IO) {
+        parseAlbumNavigationKey(albumId)?.let { (artist, album) ->
+            return@withContext musicDao.getCachedTracksList()
+                .filter { it.artist == artist && it.album == album }
+                .map { it.toPlexMetadata() }
+        }
         try {
             val response = getService().getChildren(albumId, settings.token)
             response.mediaContainer.metadata ?: emptyList()
@@ -306,6 +339,41 @@ class MusicRepository(private val context: Context) {
             searchCachedTracks(query)
         }
     }
+
+    private suspend fun getCachedArtists(): List<PlexMetadata> =
+        musicDao.getCachedTracksList()
+            .groupBy { it.artist }
+            .map { (artist, tracks) ->
+                val sample = tracks.first()
+                PlexMetadata(
+                    ratingKey = "spotcore-artist:$artist",
+                    key = "spotcore-artist:$artist",
+                    title = artist,
+                    type = "artist",
+                    thumb = sample.thumb.takeIf { it.isNotBlank() },
+                    grandparentTitle = artist
+                )
+            }
+            .sortedBy { it.title.lowercase() }
+
+    private suspend fun getCachedAlbums(): List<PlexMetadata> =
+        musicDao.getCachedTracksList()
+            .groupBy { it.artist to it.album }
+            .map { (artistAlbum, tracks) ->
+                val sample = tracks.first()
+                val (artist, album) = artistAlbum
+                PlexMetadata(
+                    ratingKey = albumNavigationKey(artist, album),
+                    key = albumNavigationKey(artist, album),
+                    title = album,
+                    type = "album",
+                    thumb = sample.thumb.takeIf { it.isNotBlank() },
+                    parentTitle = artist,
+                    year = tracks.mapNotNull { it.year }.maxOrNull(),
+                    addedAt = tracks.mapNotNull { it.addedAt }.maxOrNull()
+                )
+            }
+            .sortedBy { it.title.lowercase() }
 
     /**
      * Searches the SpotCore companion library contract. The returned model is
@@ -332,6 +400,23 @@ class MusicRepository(private val context: Context) {
         year = year,
         genres = genre?.let { listOf(PlexTag(it)) },
         media = listOf(PlexMedia(listOf(PlexPart(streamUrl))))
+    )
+
+    private fun CachedTrack.toPlexMetadata(): PlexMetadata = PlexMetadata(
+        ratingKey = ratingKey,
+        key = key,
+        title = title,
+        type = "track",
+        thumb = thumb.takeIf { it.isNotBlank() },
+        parentTitle = album,
+        grandparentTitle = artist,
+        duration = duration,
+        year = year,
+        viewCount = playCount,
+        lastViewedAt = lastPlayedAt,
+        genres = genres.split('|').filter { it.isNotBlank() }.map { PlexTag(it) },
+        collections = collections.split('|').filter { it.isNotBlank() }.map { PlexTag(it) },
+        media = listOf(PlexMedia(listOf(PlexPart(key))))
     )
 
     suspend fun smartSearch(query: String): List<PlexMetadata> = withContext(Dispatchers.IO) {

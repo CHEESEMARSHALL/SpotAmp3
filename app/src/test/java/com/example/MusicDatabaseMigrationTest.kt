@@ -12,4 +12,11 @@ class MusicDatabaseMigrationTest {
         assertEquals(7, MusicDatabase.MIGRATION_6_7.endVersion)
         assertTrue(MusicDatabase.MIGRATION_6_7.javaClass.name.isNotEmpty())
     }
+
+    @Test
+    fun companionPlayOutboxUsesExplicitEightToNineMigration() {
+        assertEquals(8, MusicDatabase.MIGRATION_8_9.startVersion)
+        assertEquals(9, MusicDatabase.MIGRATION_8_9.endVersion)
+        assertTrue(MusicDatabase.MIGRATION_8_9.javaClass.name.isNotEmpty())
+    }
 }

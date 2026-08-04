@@ -16,7 +16,8 @@ object BackendHomeMapper {
         key = dto.streamUrl,
         thumb = dto.coverUrl,
         duration = dto.duration,
-        genres = dto.genre?.takeIf(String::isNotBlank)?.let(::listOf).orEmpty()
+        genres = dto.genre?.takeIf(String::isNotBlank)?.let(::listOf).orEmpty(),
+        albumRatingKey = albumNavigationKey(dto.artist, dto.album)
     )
 
     fun merge(response: BackendHomeFeedResponse, fallback: HomeFeedState): HomeFeedState {
@@ -43,6 +44,16 @@ object BackendHomeMapper {
                 }
             )
         }.filter { it.tracks.isNotEmpty() }
+        val albumShelves = buildList {
+            response.dailyMixes.orEmpty().forEach { mix ->
+                val albums = mix.albums.map(::album).filter { it.tracks.isNotEmpty() }
+                if (albums.isNotEmpty()) add(AlbumRecommendationShelf(mix.id, mix.title, mix.reason, albums))
+            }
+            response.madeForYou.orEmpty().forEach { row ->
+                val albums = row.albums.map(::album).filter { it.tracks.isNotEmpty() }
+                if (albums.isNotEmpty()) add(AlbumRecommendationShelf(row.id, row.title, row.description, albums))
+            }
+        }
         val stations = response.stations.orEmpty().mapNotNull { station ->
             val type = radioType(station.type) ?: return@mapNotNull null
             RecommendedStation(
@@ -67,7 +78,7 @@ object BackendHomeMapper {
         }.filter { it.tracks.isNotEmpty() }
         val recentlyAdded = response.recentlyAdded.orEmpty().map { album ->
             PlexMetadata(
-                ratingKey = "companion:${album.id}",
+                ratingKey = albumNavigationKey(album.artist, album.title),
                 title = album.title,
                 type = "album",
                 thumb = album.coverUrl,
@@ -88,7 +99,7 @@ object BackendHomeMapper {
         }
         val hasCompanionContent = recent.isNotEmpty() || mixes.isNotEmpty() ||
             stations.isNotEmpty() || madeForYou.isNotEmpty() ||
-            recentlyAdded.isNotEmpty() || onThisDay != null
+            recentlyAdded.isNotEmpty() || onThisDay != null || albumShelves.isNotEmpty()
 
         if (!hasCompanionContent) return fallback
         return fallback.copy(
@@ -97,8 +108,21 @@ object BackendHomeMapper {
             dailyMixes = mixes.ifEmpty { fallback.dailyMixes },
             stations = stations.ifEmpty { fallback.stations },
             madeForYou = madeForYou.ifEmpty { fallback.madeForYou },
+            albumShelves = albumShelves.ifEmpty { fallback.albumShelves },
             onThisDay = onThisDay ?: fallback.onThisDay,
             source = HomeFeedSource.SPOTCORE
+        )
+    }
+
+    private fun album(dto: BackendAlbumDto): AlbumRecommendation {
+        val albumKey = albumNavigationKey(dto.artist, dto.title)
+        return AlbumRecommendation(
+            id = albumKey,
+            title = dto.title,
+            artist = dto.artist,
+            thumb = dto.coverUrl,
+            year = dto.year,
+            tracks = dto.tracks.map(::track).map { it.copy(albumRatingKey = albumKey) }
         )
     }
 

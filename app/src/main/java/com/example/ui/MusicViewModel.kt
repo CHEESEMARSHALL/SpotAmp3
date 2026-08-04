@@ -31,6 +31,7 @@ import com.example.data.LastFmScrobbler
 import android.content.Intent
 import android.net.Uri
 import com.example.data.toTrackItem
+import com.example.data.albumNavigationKey
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -53,16 +54,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private var searchJob: Job? = null
 
     // Configuration states
-    private val _isConfigured = MutableStateFlow(repository.settings.isConfigured)
+    private val _isConfigured = MutableStateFlow(repository.settings.isConfigured || repository.settings.isCompanionConfigured)
     val isConfigured: StateFlow<Boolean> = _isConfigured.asStateFlow()
 
     private val _libraries = MutableStateFlow<List<PlexDirectory>>(emptyList())
     val libraries: StateFlow<List<PlexDirectory>> = _libraries.asStateFlow()
 
-    private val _selectedSectionId = MutableStateFlow(repository.settings.sectionId)
+    private val _selectedSectionId = MutableStateFlow(
+        repository.settings.sectionId.ifBlank { if (repository.settings.isCompanionConfigured) "spotcore" else "" }
+    )
     val selectedSectionId: StateFlow<String> = _selectedSectionId.asStateFlow()
 
-    private val _selectedLibraryName = MutableStateFlow(repository.settings.libraryName)
+    private val _selectedLibraryName = MutableStateFlow(
+        repository.settings.libraryName.ifBlank { if (repository.settings.isCompanionConfigured) "SpotCore Library" else "" }
+    )
     val selectedLibraryName: StateFlow<String> = _selectedLibraryName.asStateFlow()
 
     // Library items
@@ -123,6 +128,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
     private val _companionRevision = MutableStateFlow(0)
+    private val _companionConfigured = MutableStateFlow(repository.settings.isCompanionConfigured)
+    val companionConfigured: StateFlow<Boolean> = _companionConfigured.asStateFlow()
 
     // Combined Reactive Home Feed State Flow
     val homeFeedState: StateFlow<HomeFeedState> = combine(
@@ -281,7 +288,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 album = track.album,
                 key = track.key,
                 thumb = track.thumb,
-                duration = track.duration
+                duration = track.duration,
+                albumRatingKey = albumNavigationKey(track.artist, track.album)
             )
             playbackManager.playTrack(trackItem, emptyList())
         }
@@ -497,7 +505,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         repository.settings.baseUrl = baseUrl.trim()
         repository.settings.token = token.trim()
         repository.settings.lyricsDirectory = lyricsDirectory.trim()
-        _isConfigured.value = repository.settings.isConfigured
+        _isConfigured.value = repository.settings.isConfigured || repository.settings.isCompanionConfigured
         updatePlaybackCredentials()
         if (repository.settings.isConfigured) {
             loadLibraries()
@@ -541,6 +549,22 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         repository.settings.companionBackendUrl = normalizedUrl
         repository.settings.companionBackendToken = normalizedToken
         playbackManager.setCompanionToken(normalizedToken)
+        _companionConfigured.value = repository.settings.isCompanionConfigured
+        _isConfigured.value = repository.settings.isConfigured || repository.settings.isCompanionConfigured
+        if (repository.settings.isCompanionConfigured && repository.settings.sectionId.isBlank()) {
+            _selectedSectionId.value = "spotcore"
+            _selectedLibraryName.value = "SpotCore Library"
+            loadInitialLibraryData()
+        } else if (!repository.settings.isConfigured && !repository.settings.isCompanionConfigured && _selectedSectionId.value == "spotcore") {
+            repository.settings.sectionId = ""
+            repository.settings.libraryName = ""
+            _selectedSectionId.value = ""
+            _selectedLibraryName.value = ""
+            _libraries.value = emptyList()
+            _artists.value = emptyList()
+            _albums.value = emptyList()
+            _recentlyAddedAlbums.value = emptyList()
+        }
         _companionRevision.value += 1
         clearErrorMessage()
     }
@@ -571,17 +595,24 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             _isLoading.value = true
             _errorMessage.value = null
             try {
+                if (!repository.settings.isConfigured && repository.settings.isCompanionConfigured) {
+                    _libraries.value = listOf(PlexDirectory("spotcore", "SpotCore Library", "music"))
+                    if (_selectedSectionId.value.isBlank()) selectLibrary("spotcore", "SpotCore Library")
+                    return@launch
+                }
                 val list = repository.getLibraries()
                 _libraries.value = list
                 if (list.isEmpty() && repository.settings.isConfigured) {
-                    _errorMessage.value = "No music libraries found on this Plex server."
+                    val backendName = if (repository.settings.isCompanionConfigured) "SpotCore" else "Plex"
+                    _errorMessage.value = "No music libraries found on $backendName."
                 } else if (list.isNotEmpty() && repository.settings.sectionId.isEmpty()) {
                     // Auto-select the first available music library section
                     val firstLib = list.first()
                     selectLibrary(firstLib.key, firstLib.title)
                 }
             } catch (e: Exception) {
-                _errorMessage.value = "Could not reach Plex server: ${e.localizedMessage}"
+                val backendName = if (repository.settings.isCompanionConfigured) "SpotCore" else "Plex"
+                _errorMessage.value = "Could not reach $backendName: ${e.localizedMessage}"
             } finally {
                 _isLoading.value = false
             }
@@ -728,7 +759,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             // Keep the local path honest when no cloud profile was requested or
             // when the provider has no verified profile result.
             _artistProfile.value = ArtistProfile(
-                bio = "No artist profile metadata is available in the indexed Plex library.",
+                bio = "No artist profile metadata is available in the indexed library.",
                 similarArtists = emptyList(),
                 styles = emptyList()
             )
@@ -776,6 +807,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     fun loadAlbumDetail(albumId: String) {
         viewModelScope.launch {
             _isLoading.value = true
+            _currentAlbumTracks.value = emptyList()
             try {
                 _currentAlbumTracks.value = repository.getAlbumTracks(albumId)
             } catch (e: Exception) {
@@ -814,7 +846,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: Exception) {
                 Log.e("MusicViewModel", "Error search", e)
                 _searchError.value = if (repository.getCachedCount() > 0) {
-                    "Plex search failed. Try again or search your cached library offline."
+                    "Backend search failed. Try again or search your cached library offline."
                 } else {
                     "Search failed because no local library cache is available. Sync your library first."
                 }
@@ -917,22 +949,25 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             album = recent.album,
             key = recent.key,
             thumb = recent.thumb,
-            duration = 0L
+            duration = 0L,
+            albumRatingKey = albumNavigationKey(recent.artist, recent.album)
         )
         playbackManager.playTrack(trackItem, listOf(trackItem))
     }
 
     private fun mapMetadataToTrackItem(meta: PlexMetadata): TrackItem? {
         val key = meta.media?.firstOrNull()?.part?.firstOrNull()?.key ?: return null
+        val artist = meta.grandparentTitle ?: meta.parentTitle ?: "Unknown Artist"
+        val album = meta.parentTitle ?: "Unknown Album"
         return TrackItem(
             ratingKey = meta.ratingKey,
             title = meta.title,
-            artist = meta.grandparentTitle ?: meta.parentTitle ?: "Unknown Artist",
-            album = meta.parentTitle ?: "Unknown Album",
+            artist = artist,
+            album = album,
             key = key,
             thumb = meta.thumb ?: "",
-            duration = meta.duration ?: 0L
-            ,albumRatingKey = meta.parentRatingKey
+            duration = meta.duration ?: 0L,
+            albumRatingKey = meta.parentRatingKey ?: albumNavigationKey(artist, album)
         )
     }
 
@@ -978,7 +1013,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun playRadioRequest(request: RadioRequest, type: RadioType) {
             val cachedTracks = repository.getCachedTracksList()
             if (cachedTracks.isEmpty()) {
-                _errorMessage.value = "This radio needs an indexed Plex library. Sync your music first."
+                _errorMessage.value = "This radio needs an indexed library. Sync your music first."
                 return
             }
 
@@ -996,7 +1031,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     RadioType.DECADE_RADIO, RadioType.TIME_TRAVEL -> "No cached tracks matched that decade."
                     RadioType.SOUNDTRACK_RADIO -> "No soundtrack metadata is available in the indexed library."
                     RadioType.FORGOTTEN_FAVORITES -> "There are no forgotten favorites in the cached history yet."
-                    else -> "This radio has no matching tracks in the cached Plex library."
+                    else -> "This radio has no matching tracks in the cached library."
                 }
             }
     }

@@ -1,6 +1,7 @@
 package com.example
 
 import com.example.data.BackendDailyMixDto
+import com.example.data.BackendAlbumDto
 import com.example.data.BackendHomeFeedResponse
 import com.example.data.BackendHomeMapper
 import com.example.data.BackendStationDto
@@ -73,5 +74,34 @@ class BackendHomeMapperTest {
 
         assertEquals(HomeFeedSource.PLEX, merged.source)
         assertTrue(merged.stations.single() === fallbackStation)
+    }
+
+    @Test
+    fun `companion shelves expose albums with their playable tracks`() {
+        val response = BackendHomeFeedResponse(
+            dailyMixes = listOf(
+                BackendDailyMixDto(
+                    id = "mix-albums",
+                    title = "Similar albums",
+                    reason = "CLAP and taxonomy matches",
+                    colors = emptyList(),
+                    tracks = listOf(track),
+                    albums = listOf(
+                        BackendAlbumDto(
+                            id = "Artist\\u0000Album",
+                            title = "Album",
+                            artist = "Artist",
+                            coverUrl = track.coverUrl,
+                            tracks = listOf(track)
+                        )
+                    )
+                )
+            )
+        )
+
+        val merged = BackendHomeMapper.merge(response, HomeFeedState())
+
+        assertEquals("Album", merged.albumShelves.single().albums.single().title)
+        assertEquals("companion:song-1", merged.albumShelves.single().albums.single().tracks.single().ratingKey)
     }
 }

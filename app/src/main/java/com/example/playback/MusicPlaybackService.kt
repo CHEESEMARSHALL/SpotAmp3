@@ -11,6 +11,7 @@ import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import coil.Coil
 import coil.request.ImageRequest
+import com.example.data.PlexSettingsManager
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 
@@ -87,7 +88,7 @@ class MusicPlaybackService : Service() {
             Notification.Builder(this)
         }
         val notification = notificationBuilder
-            .setContentTitle("Plex Music Player")
+            .setContentTitle("SpotAmp")
             .setContentText("Preparing playback...")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setOngoing(true)
@@ -153,21 +154,36 @@ class MusicPlaybackService : Service() {
         var largeIcon: Bitmap? = null
         val baseUrlVal = playbackManager.baseUrl
         val tokenVal = playbackManager.token
+        val settings = PlexSettingsManager(this)
+        val companionBase = settings.companionBackendUrl.trimEnd('/')
 
-        if (track.thumb.isNotEmpty() && baseUrlVal.isNotEmpty() && tokenVal.isNotEmpty()) {
+        if (track.thumb.isNotEmpty()) {
             val normalizedBaseUrl = if (baseUrlVal.endsWith("/")) baseUrlVal.dropLast(1) else baseUrlVal
-            val imageUrl = "$normalizedBaseUrl${track.thumb}"
-
-            if (imageUrl == lastLoadedThumbUrl && lastLoadedBitmap != null) {
-                largeIcon = lastLoadedBitmap
+            val imageUrl = if (track.thumb.startsWith("http://") || track.thumb.startsWith("https://")) {
+                track.thumb
             } else {
+                "$normalizedBaseUrl${track.thumb}"
+            }
+            val isCompanionArtwork = companionBase.isNotBlank() &&
+                (imageUrl == companionBase || imageUrl.startsWith("$companionBase/"))
+            val hasArtworkCredentials = if (isCompanionArtwork) {
+                settings.companionBackendToken.isNotBlank()
+            } else {
+                baseUrlVal.isNotBlank() && tokenVal.isNotBlank()
+            }
+
+            if (hasArtworkCredentials && imageUrl == lastLoadedThumbUrl && lastLoadedBitmap != null) {
+                largeIcon = lastLoadedBitmap
+            } else if (hasArtworkCredentials) {
                 try {
                     val imageLoader = Coil.imageLoader(this)
-                    val request = ImageRequest.Builder(this)
-                        .data(imageUrl)
-                        .addHeader("X-Plex-Token", tokenVal)
-                        .allowHardware(false) // Safe for Notification large icons
-                        .build()
+                    val request = ImageRequest.Builder(this).data(imageUrl).apply {
+                        if (isCompanionArtwork) {
+                            addHeader("Authorization", "Bearer ${settings.companionBackendToken}")
+                        } else {
+                            addHeader("X-Plex-Token", tokenVal)
+                        }
+                    }.allowHardware(false).build()
                     val result = withContext(Dispatchers.IO) {
                         imageLoader.execute(request)
                     }

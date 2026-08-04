@@ -77,6 +77,23 @@ data class MadeForYouItem(
     val thumb: String
 )
 
+/** Album-first discovery item. Tracks stay attached for detail and playback actions. */
+data class AlbumRecommendation(
+    val id: String,
+    val title: String,
+    val artist: String,
+    val thumb: String,
+    val year: Int? = null,
+    val tracks: List<TrackItem> = emptyList()
+)
+
+data class AlbumRecommendationShelf(
+    val id: String,
+    val title: String,
+    val reason: String,
+    val albums: List<AlbumRecommendation>
+)
+
 data class MoreFromSection(
     val title: String,
     val type: String, // "genre" or "collection"
@@ -118,6 +135,7 @@ data class HomeFeedState(
     val jumpBackIn: List<JumpBackInItem> = emptyList(),
     val stations: List<RecommendedStation> = emptyList(),
     val madeForYou: List<MadeForYouItem> = emptyList(),
+    val albumShelves: List<AlbumRecommendationShelf> = emptyList(),
     val moreFromSections: List<MoreFromSection> = emptyList(),
     val mostPlayedThisMonth: List<MostPlayedItem> = emptyList(),
     val onThisDay: OnThisDayItem? = null,
@@ -167,6 +185,7 @@ class HomeRecommendationEngine(private val context: Context) {
             val dailyMixes = buildRealDailyMixes(cachedTracks)
             val jumpBackIn = buildRealJumpBackIn(realHistory, cachedTracks)
             val madeForYou = buildRealMadeForYou(cachedTracks)
+            val albumShelves = buildRealAlbumShelves(cachedTracks)
             val moreFromSections = buildRealMoreFromSections(cachedTracks)
             val mostPlayed = buildRealMostPlayed(realHistory, cachedTracks)
             val onThisDay = buildRealOnThisDay(cachedTracks)
@@ -179,6 +198,7 @@ class HomeRecommendationEngine(private val context: Context) {
                 jumpBackIn = jumpBackIn,
                 stations = stations,
                 madeForYou = madeForYou,
+                albumShelves = albumShelves,
                 moreFromSections = moreFromSections,
                 mostPlayedThisMonth = mostPlayed,
                 onThisDay = onThisDay,
@@ -212,7 +232,8 @@ class HomeRecommendationEngine(private val context: Context) {
                 album = item.album,
                 key = item.key,
                 thumb = item.thumb,
-                duration = cached?.duration ?: 0L
+                duration = cached?.duration ?: 0L,
+                albumRatingKey = albumNavigationKey(item.artist, item.album)
             )
 
             val elapsed = (now - item.timestamp).coerceAtLeast(0L)
@@ -332,12 +353,12 @@ class HomeRecommendationEngine(private val context: Context) {
         uniqueAlbums.take(4).forEach { (_, recent) ->
             items.add(
                 JumpBackInItem(
-                    id = "jbi_alb_${recent.ratingKey}",
+                    id = "jbi_alb_${albumNavigationKey(recent.artist, recent.album)}",
                     title = recent.album,
                     subtitle = recent.artist,
                     thumb = recent.thumb,
                     type = "album",
-                    extraData = recent.ratingKey
+                    extraData = albumNavigationKey(recent.artist, recent.album)
                 )
             )
         }
@@ -476,6 +497,63 @@ class HomeRecommendationEngine(private val context: Context) {
         return list
     }
 
+    private fun buildRealAlbumShelves(cachedTracks: List<CachedTrack>): List<AlbumRecommendationShelf> {
+        val groups = cachedTracks
+            .filter { it.album.isNotBlank() }
+            .groupBy { "${it.artist}\u0000${it.album}" }
+            .mapValues { (_, tracks) -> tracks.sortedWith(compareBy<CachedTrack> { it.title }.thenBy { it.ratingKey }) }
+        val used = mutableSetOf<String>()
+
+        fun shelf(id: String, title: String, reason: String, candidates: List<Pair<String, List<CachedTrack>>>): AlbumRecommendationShelf? {
+            val albums = candidates.asSequence()
+                .filter { (key, _) -> used.add(key) }
+                .take(8)
+                .map { (key, tracks) ->
+                    val first = tracks.first()
+                    AlbumRecommendation(
+                        id = albumNavigationKey(first.artist, first.album),
+                        title = first.album,
+                        artist = first.artist,
+                        thumb = first.thumb,
+                        year = first.year,
+                        tracks = tracks.map { it.toTrackItem() }
+                    )
+                }.toList()
+            return albums.takeIf { it.isNotEmpty() }?.let { AlbumRecommendationShelf(id, title, reason, it) }
+        }
+
+        val entries = groups.entries.map { it.key to it.value }
+        val shelves = mutableListOf<AlbumRecommendationShelf>()
+        shelf("albums-recent", "Recently added albums", "Albums added most recently to your library.", entries.sortedByDescending { entry -> entry.second.maxOfOrNull { it.addedAt ?: 0L } ?: 0L })?.let(shelves::add)
+        shelf("albums-unplayed", "Unplayed albums", "Full albums waiting for a first listen.", entries.filter { entry -> entry.second.all { it.playCount == 0 } }.sortedBy { it.first })?.let(shelves::add)
+        shelf("albums-familiar", "Albums you return to", "Your most-played albums, kept together for an album-length listen.", entries.sortedByDescending { entry -> entry.second.sumOf { it.playCount } })?.let(shelves::add)
+        shelf("albums-collections", "Soundtracks and collections", "Distinct collection shelves from your library metadata.", entries.filter { entry -> entry.second.any { it.collections.contains("soundtrack", true) || it.genres.contains("soundtrack", true) || it.album.contains("OST", true) } }.sortedBy { it.first })?.let(shelves::add)
+
+        // Keep this as an album shelf. Rendering its tracks through the generic
+        // MoreFromSection makes every song look like a separate album tile.
+        val albumsForDiscovery = entries.sortedBy { it.first }
+        if (albumsForDiscovery.isNotEmpty()) {
+            val selected = albumsForDiscovery[deterministicDailyIndex(albumsForDiscovery.size, System.currentTimeMillis())]
+            val first = selected.second.first()
+            shelves += AlbumRecommendationShelf(
+                id = "albums-random",
+                title = "Random Album Discovery",
+                reason = "One complete album selected from your indexed library.",
+                albums = listOf(
+                    AlbumRecommendation(
+                        id = albumNavigationKey(first.artist, first.album),
+                        title = first.album,
+                        artist = first.artist,
+                        thumb = first.thumb,
+                        year = first.year,
+                        tracks = selected.second.map { it.toTrackItem() }
+                    )
+                )
+            )
+        }
+        return shelves
+    }
+
     private fun buildRealMoreFromSections(cachedTracks: List<CachedTrack>): List<MoreFromSection> {
         val sections = mutableListOf<MoreFromSection>()
         val explanationService = RecommendationExplanationService()
@@ -493,22 +571,6 @@ class HomeRecommendationEngine(private val context: Context) {
                     title = "More from $artistName",
                     type = "artist",
                     tracks = tracks.sortedBy { it.ratingKey }.take(8).map { it.toTrackItem() }
-                )
-            )
-        }
-
-        // Group by album
-        val albumGroups = cachedTracks.groupBy { it.album }
-            .toList()
-            .filter { it.second.size >= 4 }
-            .sortedBy { it.first }
-
-        albumGroups.take(1).forEach { (albumName, tracks) ->
-            sections.add(
-                MoreFromSection(
-                    title = "Full Album: $albumName",
-                    type = "album",
-                    tracks = tracks.sortedBy { it.ratingKey }.map { it.toTrackItem() }
                 )
             )
         }
@@ -548,18 +610,6 @@ class HomeRecommendationEngine(private val context: Context) {
         if (soundtrack.isNotEmpty()) {
             val title = "Soundtracks and Game Music"
             sections.add(MoreFromSection(title, "collection", soundtrack.map { it.toTrackItem() }, explanationService.explainShelf(title, soundtrack).text))
-        }
-
-        val albumsForDiscovery = cachedTracks.groupBy { it.album }.entries.sortedBy { it.key }
-        val randomAlbum = if (albumsForDiscovery.isEmpty()) {
-            emptyList()
-        } else {
-            val dayIndex = deterministicDailyIndex(albumsForDiscovery.size, System.currentTimeMillis())
-            albumsForDiscovery[dayIndex].value
-        }
-        if (randomAlbum.isNotEmpty()) {
-            val title = "Random Album Discovery"
-            sections.add(MoreFromSection(title, "album", randomAlbum.sortedBy { it.ratingKey }.map { it.toTrackItem() }, explanationService.explainShelf(title, randomAlbum).text))
         }
 
         return sections
@@ -842,6 +892,7 @@ fun CachedTrack.toTrackItem(): TrackItem {
         key = this.key,
         thumb = this.thumb,
         duration = this.duration,
-        genres = this.genres.split('|').map { it.trim() }.filter { it.isNotEmpty() }
+        genres = this.genres.split('|').map { it.trim() }.filter { it.isNotEmpty() },
+        albumRatingKey = albumNavigationKey(this.artist, this.album)
     )
 }

@@ -120,6 +120,13 @@ data class ListeningHistoryEntity(
     val lastSkippedAt: Long? = null
 )
 
+@Entity(tableName = "pending_companion_plays")
+data class PendingCompanionPlayEntity(
+    @PrimaryKey val eventId: String,
+    val trackId: String,
+    val playedAt: Long
+)
+
 @Dao
 interface MusicDao {
     // Cached tracks for AI indexing
@@ -226,6 +233,15 @@ interface MusicDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun saveListeningHistory(history: ListeningHistoryEntity)
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertPendingCompanionPlay(event: PendingCompanionPlayEntity): Long
+
+    @Query("SELECT * FROM pending_companion_plays ORDER BY playedAt ASC LIMIT :limit")
+    suspend fun getPendingCompanionPlays(limit: Int = 50): List<PendingCompanionPlayEntity>
+
+    @Query("DELETE FROM pending_companion_plays WHERE eventId = :eventId")
+    suspend fun deletePendingCompanionPlay(eventId: String)
+
     // Liked tracks
     @Query("SELECT * FROM liked_tracks ORDER BY likedAt DESC")
     fun getAllLikedTracks(): Flow<List<LikedTrackEntity>>
@@ -253,9 +269,10 @@ interface MusicDao {
         LikedTrackEntity::class,
         PlaybackStateEntity::class,
         ListeningHistoryEntity::class,
+        PendingCompanionPlayEntity::class,
         SyncStateEntity::class
     ],
-    version = 8,
+    version = 9,
     exportSchema = false
 )
 abstract class MusicDatabase : RoomDatabase() {
@@ -282,6 +299,19 @@ abstract class MusicDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_8_9 = object : Migration(8, 9) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    """CREATE TABLE IF NOT EXISTS pending_companion_plays (
+                        eventId TEXT NOT NULL,
+                        trackId TEXT NOT NULL,
+                        playedAt INTEGER NOT NULL,
+                        PRIMARY KEY(eventId)
+                    )""".trimIndent()
+                )
+            }
+        }
+
         @Volatile
         private var INSTANCE: MusicDatabase? = null
 
@@ -292,7 +322,7 @@ abstract class MusicDatabase : RoomDatabase() {
                     MusicDatabase::class.java,
                     "music_database"
                 )
-                .addMigrations(MIGRATION_6_7)
+                .addMigrations(MIGRATION_6_7, MIGRATION_8_9)
                 .fallbackToDestructiveMigrationFrom(1, 2, 3, 4, 5)
                 .build()
                 INSTANCE = instance

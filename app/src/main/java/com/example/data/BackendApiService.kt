@@ -43,13 +43,22 @@ data class BackendTrackDto(
 )
 
 @JsonClass(generateAdapter = true)
+data class BackendPlaybackEventRequest(
+    @Json(name = "trackId") val trackId: String,
+    @Json(name = "playedAt") val playedAt: Long,
+    @Json(name = "eventId") val eventId: String,
+    @Json(name = "source") val source: String = "spotamp"
+)
+
+@JsonClass(generateAdapter = true)
 data class BackendAlbumDto(
     @Json(name = "id") val id: String,
     @Json(name = "title") val title: String,
     @Json(name = "artist") val artist: String,
     @Json(name = "coverUrl") val coverUrl: String,
     @Json(name = "year") val year: Int? = null,
-    @Json(name = "trackCount") val trackCount: Int? = null
+    @Json(name = "trackCount") val trackCount: Int? = null,
+    @Json(name = "tracks") val tracks: List<BackendTrackDto> = emptyList()
 )
 
 @JsonClass(generateAdapter = true)
@@ -58,7 +67,8 @@ data class BackendDailyMixDto(
     @Json(name = "title") val title: String,
     @Json(name = "reason") val reason: String,
     @Json(name = "colors") val colors: List<String>, // Hex list e.g. ["#4F46E5", "#06B6D4"]
-    @Json(name = "tracks") val tracks: List<BackendTrackDto>
+    @Json(name = "tracks") val tracks: List<BackendTrackDto>,
+    @Json(name = "albums") val albums: List<BackendAlbumDto> = emptyList()
 )
 
 @JsonClass(generateAdapter = true)
@@ -77,7 +87,8 @@ data class BackendMadeForYouDto(
     @Json(name = "description") val description: String,
     @Json(name = "artists") val artists: List<String>,
     @Json(name = "tracks") val tracks: List<BackendTrackDto>,
-    @Json(name = "coverUrl") val coverUrl: String
+    @Json(name = "coverUrl") val coverUrl: String,
+    @Json(name = "albums") val albums: List<BackendAlbumDto> = emptyList()
 )
 
 @JsonClass(generateAdapter = true)
@@ -115,6 +126,12 @@ interface BackendApiService {
 
     @GET("api/v1/playlists")
     suspend fun getPlaylists(@Header("Authorization") userAuthToken: String? = null): BackendEnvelope
+
+    @POST("api/v1/events/playback")
+    suspend fun recordPlaybackEvent(
+        @Body event: BackendPlaybackEventRequest,
+        @Header("Authorization") userAuthToken: String? = null
+    ): BackendEnvelope
     
     // GET personalized home feed from your proxy backend
     @GET("api/v1/music/home")

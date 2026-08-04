@@ -39,6 +39,7 @@ fun DownloadsScreen(
     val downloadedTracks by viewModel.downloadedTracks.collectAsStateWithLifecycle()
     val downloadProgresses by viewModel.downloadProgresses.collectAsStateWithLifecycle()
     val playlists by viewModel.playlists.collectAsStateWithLifecycle()
+    val currentTrack by viewModel.playbackManager.currentTrack.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val completedTracks = downloadedTracks.filter { it.status == "completed" && !it.localPath.isNullOrBlank() }
     val pendingTracks = downloadedTracks.filter { it.status != "completed" }
@@ -316,7 +317,8 @@ fun DownloadsScreen(
                                 onClick = {
                                     val playbackTracks = completedTracks.map { it.toTrackItem() }
                                     viewModel.playbackManager.playTrack(track.toTrackItem(), playbackTracks)
-                                }
+                                },
+                                isPlaying = currentTrack?.ratingKey == track.ratingKey
                             )
                         }
                     }
@@ -405,7 +407,7 @@ fun DownloadedAlbumRow(
     val context = LocalContext.current
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
     val firstTrack = tracks.firstOrNull()
-    val imageUrl = if (!firstTrack?.thumb.isNullOrEmpty()) "$normalizedBaseUrl${firstTrack?.thumb}" else null
+    val imageUrl = if (!firstTrack?.thumb.isNullOrEmpty()) resolveArtworkUrl(baseUrl, firstTrack?.thumb.orEmpty()) else null
     val totalSizeMb = tracks.sumOf { it.fileSize } / (1024.0 * 1024.0)
     val sizeFormat = DecimalFormat("#.##")
 
@@ -429,11 +431,7 @@ fun DownloadedAlbumRow(
             ) {
                 if (imageUrl != null) {
                     AsyncImage(
-                        model = ImageRequest.Builder(context)
-                            .data(imageUrl)
-                            .addHeader("X-Plex-Token", token)
-                            .crossfade(true)
-                            .build(),
+                        model = authenticatedArtworkRequest(context, imageUrl, token),
                         contentDescription = albumName,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
@@ -590,7 +588,7 @@ fun DownloadedPlaylistRow(
     val context = LocalContext.current
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
     val firstTrack = offlineTracks.firstOrNull()
-    val imageUrl = if (!firstTrack?.thumb.isNullOrEmpty()) "$normalizedBaseUrl${firstTrack?.thumb}" else null
+    val imageUrl = if (!firstTrack?.thumb.isNullOrEmpty()) resolveArtworkUrl(baseUrl, firstTrack?.thumb.orEmpty()) else null
     val totalSizeMb = offlineTracks.sumOf { t ->
         downloadedTracks.find { it.ratingKey == t.ratingKey }?.fileSize ?: 0L
     } / (1024.0 * 1024.0)
@@ -616,11 +614,7 @@ fun DownloadedPlaylistRow(
             ) {
                 if (imageUrl != null) {
                     AsyncImage(
-                        model = ImageRequest.Builder(context)
-                            .data(imageUrl)
-                            .addHeader("X-Plex-Token", token)
-                            .crossfade(true)
-                            .build(),
+                        model = authenticatedArtworkRequest(context, imageUrl, token),
                         contentDescription = playlist.name,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
@@ -773,21 +767,23 @@ fun DownloadedTrackRow(
     baseUrl: String,
     token: String,
     onDelete: () -> Unit,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    isPlaying: Boolean = false
 ) {
     val context = LocalContext.current
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-    val imageUrl = if (track.thumb.isNotEmpty()) "$normalizedBaseUrl${track.thumb}" else null
+    val imageUrl = if (track.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, track.thumb) else null
     val sizeMb = track.fileSize / (1024.0 * 1024.0)
     val sizeFormat = DecimalFormat("#.##")
+    val activeColor = MaterialTheme.colorScheme.primary
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
+            .background(if (isPlaying) activeColor.copy(alpha = 0.15f) else Color.White.copy(alpha = 0.02f))
             .clickable { onClick() }
-            .background(Color.White.copy(alpha = 0.02f))
-            .padding(12.dp),
+            .padding(vertical = 7.dp, horizontal = 10.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         // Track Index Number
@@ -808,11 +804,7 @@ fun DownloadedTrackRow(
         ) {
             if (imageUrl != null) {
                 AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(imageUrl)
-                        .addHeader("X-Plex-Token", token)
-                        .crossfade(true)
-                        .build(),
+                    model = authenticatedArtworkRequest(context, imageUrl, token),
                     contentDescription = track.title,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -848,7 +840,7 @@ fun DownloadedTrackRow(
                 text = track.title,
                 style = MaterialTheme.typography.bodyLarge.copy(
                     fontWeight = FontWeight.Bold,
-                    color = Color.White
+                    color = if (isPlaying) activeColor else Color.White
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis

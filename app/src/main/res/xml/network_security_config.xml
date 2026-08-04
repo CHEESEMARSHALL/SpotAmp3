@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <base-config cleartextTrafficPermitted="false" />
-    <!-- Explicit development/local Plex endpoints. Production Plex should use HTTPS. -->
+    <!-- SpotCore's companion server is intentionally local-first and currently
+         serves HTTP on a user-selected LAN address. The app also supports
+         user-configured local Plex endpoints, so a build-time host allowlist
+         cannot cover the configured backend safely or reliably. -->
+    <base-config cleartextTrafficPermitted="true" />
+    <!-- Explicit development/local Plex endpoints retained for documentation. -->
     <domain-config cleartextTrafficPermitted="true">
         <domain includeSubdomains="false">localhost</domain>
         <domain includeSubdomains="false">127.0.0.1</domain>

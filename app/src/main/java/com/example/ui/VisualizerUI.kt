@@ -16,6 +16,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import coil.compose.AsyncImage
 
@@ -108,8 +109,13 @@ fun PlaybackVisualSurface(
     mode: PlaybackArtworkMode,
     onModeChange: (PlaybackArtworkMode) -> Unit,
     modifier: Modifier = Modifier,
-    onClick: (() -> Unit)? = null
+    onClick: (() -> Unit)? = null,
+    token: String = ""
 ) {
+    val context = LocalContext.current
+    val artworkRequest = remember(artworkUrl, token) {
+        artworkUrl?.let { authenticatedArtworkRequest(context, it, token) }
+    }
     val nextMode = {
         val next = when (mode) {
             PlaybackArtworkMode.ARTWORK ->
@@ -140,7 +146,7 @@ fun PlaybackVisualSurface(
             when (currentMode) {
                 PlaybackArtworkMode.ARTWORK -> {
                     AsyncImage(
-                        model = artworkUrl,
+                        model = artworkRequest,
                         contentDescription = "Album artwork",
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
