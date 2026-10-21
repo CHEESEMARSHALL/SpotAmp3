@@ -1282,7 +1282,16 @@ class CompanionRealPlaybackTest {
         composeRule.onNode(
             hasText("QA Track A") and hasAnyAncestor(hasTestTag("library_tracks_list"))
         ).assertIsDisplayed()
-        composeRule.onNodeWithContentDescription("Remove SpotCore favorite").performClick()
+        val removeFavorite = composeRule.onNodeWithContentDescription(
+            "Remove SpotCore favorite",
+            useUnmergedTree = true
+        )
+        // Cached library emissions are intentionally debounced during paged
+        // sync. Wait for the row's UI state to catch up before tapping it.
+        composeRule.waitUntil(10_000L) {
+            runCatching { removeFavorite.fetchSemanticsNode() }.isSuccess
+        }
+        removeFavorite.performClick()
         awaitRemoteTrackState(favorite = false, rating = 5)
         composeRule.onNodeWithText("★5").performClick()
         composeRule.onNodeWithText("2 stars").performClick()
