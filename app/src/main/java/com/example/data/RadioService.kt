@@ -9,6 +9,8 @@ data class RadioRequest(
     val seedArtist: String? = null,
     val seedAlbum: String? = null,
     val genre: String? = null,
+    val mood: String? = null,
+    val style: String? = null,
     val collection: String? = null,
     val decadeStart: Int? = null,
     val trackCount: Int = 40,
@@ -45,6 +47,7 @@ class RadioService {
             .filter { cooldownMillis == 0L || now - it.timestamp <= cooldownMillis }
             .map { it.ratingKey }
             .toSet()
+        val tagService = LocalMetadataTagService()
         val candidates = when (request.type) {
             RadioType.ARTIST_RADIO -> {
                 val seedArtist = request.seedArtist
@@ -112,7 +115,13 @@ class RadioService {
                     }
                 }
             }
-            RadioType.GENRE_RADIO, RadioType.MOOD_RADIO, RadioType.STYLE_RADIO -> tracks.filter { request.genre != null && it.hasGenre(request.genre) }
+            RadioType.GENRE_RADIO -> tracks.filter { request.genre != null && it.hasGenre(request.genre) }
+            RadioType.MOOD_RADIO -> tracks.filter { track ->
+                request.mood != null && tagService.tag(track).moods.any { it.equals(request.mood, ignoreCase = true) }
+            }
+            RadioType.STYLE_RADIO -> tracks.filter { track ->
+                request.style != null && tagService.tag(track).styleTags.any { it.equals(request.style, ignoreCase = true) }
+            }
             RadioType.COLLECTION_RADIO -> tracks.filter { request.collection != null && it.hasCollection(request.collection) }
             RadioType.DECADE_RADIO -> {
                 val start = request.decadeStart ?: (tracks.mapNotNull { it.year }.minOrNull()?.let { (it / 10) * 10 } ?: 1990)
@@ -125,10 +134,10 @@ class RadioService {
             RadioType.FORGOTTEN_FAVORITES -> tracks.filter { it.playCount > 0 && it.ratingKey !in recentKeys }
             RadioType.DEEP_CUTS -> tracks.sortedWith(compareBy<CachedTrack> { it.playCount }.thenBy { it.lastPlayedAt ?: Long.MIN_VALUE })
             RadioType.RANDOM_ALBUM -> {
-                val albums = tracks.groupBy { it.album }.entries.sortedBy { it.key }
+                val albums = groupCachedAlbums(tracks).sortedBy { it.album }
                 if (albums.isEmpty()) emptyList() else {
                     val dayIndex = deterministicDailyIndex(albums.size, System.currentTimeMillis())
-                    albums[dayIndex].value
+                    albums[dayIndex].tracks
                 }
             }
             RadioType.RECENTLY_ADDED_RADIO -> tracks.sortedWith(

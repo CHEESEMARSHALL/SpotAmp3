@@ -56,6 +56,8 @@ data class PlexMetadata(
     ,@Json(name = "Collection") val collections: List<PlexTag>? = null
     ,@Json(name = "grandparentRatingKey") val grandparentRatingKey: String? = null
     ,@Json(name = "parentRatingKey") val parentRatingKey: String? = null
+    ,@Json(name = "albumArtist") val albumArtist: String? = null
+    ,@Json(name = "parentIndex") val parentIndex: Int? = null // disc number for album tracks
 )
 
 @JsonClass(generateAdapter = true)
@@ -137,10 +139,16 @@ object PlexClientManager {
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
+        .addInterceptor(QaNetworkInterceptor())
         .build()
 
     fun getApiService(baseUrl: String): PlexApiService {
-        val normalizedUrl = if (baseUrl.endsWith("/")) baseUrl else "$baseUrl/"
+        var normalizedUrl = baseUrl.trim()
+        if (!normalizedUrl.startsWith("http://") && !normalizedUrl.startsWith("https://") && normalizedUrl.isNotBlank()) {
+            normalizedUrl = "http://$normalizedUrl"
+        }
+        if (!normalizedUrl.endsWith("/")) normalizedUrl = "$normalizedUrl/"
+
         if (normalizedUrl == currentUrl && cachedService != null) {
             return cachedService!!
         }

@@ -1,0 +1,39 @@
+{
+  "contractVersion": "1.4",
+  "recentlyPlayed": [
+    {
+      "id": "track-42",
+      "title": "Blue Signal",
+      "artist": "Northstar",
+      "album": "Night Drive",
+      "albumArtist": "Northstar",
+      "streamUrl": "/api/v1/media/stream/track-42",
+      "coverUrl": "/api/v1/media/art/track-42",
+      "duration": 210250
+    }
+  ],
+  "recentlyAdded": [
+    {
+      "id": "album-night-drive",
+      "title": "Night Drive",
+      "artist": "Northstar",
+      "albumArtist": "Northstar",
+      "coverUrl": "/api/v1/media/art/track-42",
+      "year": 2024,
+      "trackCount": 1,
+      "tracks": [
+        {
+          "id": "track-42",
+          "title": "Blue Signal",
+          "artist": "Northstar",
+          "album": "Night Drive",
+          "albumArtist": "Northstar",
+          "streamUrl": "/api/v1/media/stream/track-42",
+          "coverUrl": "/api/v1/media/art/track-42",
+          "duration": 210250,
+          "trackNumber": 7
+        }
+      ]
+    }
+  ]
+}

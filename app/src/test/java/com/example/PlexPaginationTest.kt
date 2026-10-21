@@ -2,6 +2,7 @@ package com.example
 
 import com.example.data.PlexPagination
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlinx.coroutines.runBlocking
 
@@ -30,5 +31,19 @@ class PlexPaginationTest {
         } catch (_: IllegalArgumentException) {
             // expected
         }
+    }
+
+    @Test
+    fun repeatedFullPageFailsInsteadOfLooping() = runBlocking {
+        var calls = 0
+        val thrown = runCatching {
+            PlexPagination.collect(pageSize = 2) { _, _ ->
+                calls++
+                listOf("a", "b")
+            }
+        }.exceptionOrNull()
+
+        assertTrue(thrown is IllegalStateException)
+        assertEquals(3, calls)
     }
 }

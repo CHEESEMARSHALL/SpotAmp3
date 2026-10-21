@@ -1,0 +1,48 @@
+{
+  "contractVersion": "1.4",
+  "tracks": [
+    {
+      "trackId": "track-42",
+      "components": [
+        {
+          "component": "essentia",
+          "state": "Complete",
+          "analysisVersion": "essentia-3",
+          "updatedAt": 1700000000001,
+          "analyzedAt": 1700000000000
+        },
+        {
+          "component": "clap",
+          "state": "Complete",
+          "analysisVersion": "clap-music-intelligence-v1",
+          "updatedAt": 1700000000002,
+          "analyzedAt": 1700000000000
+        }
+      ],
+      "features": {
+        "analysisVersion": "essentia-3",
+        "bpm": 123.5,
+        "musicalKey": "C minor",
+        "energy": 0.72,
+        "danceability": 0.81,
+        "analyzedAt": 1700000000000,
+        "extractorId": "essentia",
+        "extractorVersion": "3"
+      },
+      "labels": [
+        {
+          "type": "mood",
+          "value": "warm",
+          "score": 0.91,
+          "source": "clap-zero-shot",
+          "modelId": "clap-music",
+          "modelVersion": "1.2",
+          "taxonomyVersion": "taxonomy-7",
+          "reviewStatus": "reviewed",
+          "manuallyLocked": true,
+          "updatedAt": 1700000000002
+        }
+      ]
+    }
+  ]
+}

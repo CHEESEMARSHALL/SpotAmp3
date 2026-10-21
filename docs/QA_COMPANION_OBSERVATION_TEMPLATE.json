@@ -1,0 +1,18 @@
+{
+  "runId": "REPLACE_WITH_QA_RUN_ID",
+  "spotCoreBuild": "REPLACE_WITH_SPOTCORE_BUILD",
+  "paired": false,
+  "audibleObserved": false,
+  "steps": [
+    { "number": 1, "observed": false, "notes": "Companion-backed track identity and stream origin" },
+    { "number": 2, "observed": false, "notes": "Audible playback, notification, position advancement" },
+    { "number": 3, "observed": false, "notes": "Pause and resume" },
+    { "number": 4, "observed": false, "notes": "Seek without changing track" },
+    { "number": 5, "observed": false, "notes": "Second track, queue, and notification metadata" },
+    { "number": 6, "observed": false, "notes": "Background/return and state restoration" },
+    { "number": 7, "observed": false, "notes": "Connection interruption and recovery" },
+    { "number": 8, "observed": false, "notes": "Exactly-once playback-event delivery or idempotent retry" }
+  ],
+  "redactionConfirmed": false
+}
+

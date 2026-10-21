@@ -2,6 +2,7 @@ package com.example.data
 
 import android.content.Context
 import android.util.Log
+import com.example.R
 import com.example.playback.TrackItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.firstOrNull
@@ -28,10 +29,7 @@ data class DailyMix(
     val reason: String,
     val tracks: List<TrackItem>,
     val colors: List<Long> // Hex colors for gradient background
-) {
-    val description: String
-        get() = "Based on " + reason
-}
+)
 
 data class JumpBackInItem(
     val id: String,
@@ -76,6 +74,11 @@ data class MadeForYouItem(
     val tracks: List<TrackItem>,
     val thumb: String
 )
+
+internal fun PlexMetadata.homeAlbumArtist(): String =
+    albumArtist?.takeIf(String::isNotBlank)
+        ?: parentTitle?.takeIf(String::isNotBlank)
+        ?: "Various Artists"
 
 /** Album-first discovery item. Tracks stay attached for detail and playback actions. */
 data class AlbumRecommendation(
@@ -144,6 +147,16 @@ data class HomeFeedState(
     val source: HomeFeedSource = HomeFeedSource.PLEX
 )
 
+internal fun fallbackHomeFeedState(
+    recentlyAdded: List<PlexMetadata>,
+    history: List<RecentTrack>,
+    stations: List<RecommendedStation>
+): HomeFeedState = HomeFeedState(
+    recentlyAdded = recentlyAdded,
+    stations = stations,
+    history = history.take(10)
+)
+
 enum class HomeFeedSource {
     PLEX,
     SPOTCORE
@@ -182,32 +195,28 @@ class HomeRecommendationEngine(private val context: Context) {
         try {
             // Real Plex Metadata Analyzer
             val recentPlays = buildRealRecentPlays(realHistory, cachedTracks)
-            val dailyMixes = buildRealDailyMixes(cachedTracks)
-            val jumpBackIn = buildRealJumpBackIn(realHistory, cachedTracks)
+            val dailyMixes = buildRealDailyMixes(cachedTracks, realHistory)
             val madeForYou = buildRealMadeForYou(cachedTracks)
-            val albumShelves = buildRealAlbumShelves(cachedTracks)
-            val moreFromSections = buildRealMoreFromSections(cachedTracks)
+            val albumShelves = buildRealAlbumShelves(cachedTracks, realRecentlyAdded)
+            val moreFromSections = buildRealMoreFromSections(cachedTracks, realHistory)
             val mostPlayed = buildRealMostPlayed(realHistory, cachedTracks)
             val onThisDay = buildRealOnThisDay(cachedTracks)
-            val newReleases = buildRealNewReleases(realRecentlyAdded, cachedTracks)
 
             HomeFeedState(
                 recentPlays = recentPlays,
                 recentlyAdded = realRecentlyAdded,
                 dailyMixes = dailyMixes,
-                jumpBackIn = jumpBackIn,
                 stations = stations,
                 madeForYou = madeForYou,
                 albumShelves = albumShelves,
                 moreFromSections = moreFromSections,
                 mostPlayedThisMonth = mostPlayed,
                 onThisDay = onThisDay,
-                newReleases = newReleases,
                 history = realHistory.take(10)
             )
         } catch (e: Exception) {
-            Log.e("HomeRecommendationEngine", "Error generating real recommendation feed", e)
-            HomeFeedState(recentlyAdded = realRecentlyAdded, history = realHistory.take(10))
+            Log.e("HomeRecommendationEngine", "Error generating local recommendations (${e::class.simpleName})")
+            fallbackHomeFeedState(realRecentlyAdded, realHistory, stations)
         }
     }
 
@@ -233,7 +242,11 @@ class HomeRecommendationEngine(private val context: Context) {
                 key = item.key,
                 thumb = item.thumb,
                 duration = cached?.duration ?: 0L,
-                albumRatingKey = albumNavigationKey(item.artist, item.album)
+                albumRatingKey = albumNavigationKey(
+                    cached?.effectiveAlbumArtist() ?: effectiveAlbumArtist(item.albumArtist, item.artist),
+                    item.album
+                ),
+                albumArtist = cached?.effectiveAlbumArtist() ?: effectiveAlbumArtist(item.albumArtist, item.artist)
             )
 
             val elapsed = (now - item.timestamp).coerceAtLeast(0L)
@@ -257,89 +270,50 @@ class HomeRecommendationEngine(private val context: Context) {
         }
     }
 
-    private fun buildRealDailyMixes(cachedTracks: List<CachedTrack>): List<DailyMix> {
-        val mixes = mutableListOf<DailyMix>()
-        
-        // Group tracks by artist to make clusters
-        val artistGroups = cachedTracks.groupBy { it.artist }
-            .toList()
-            .sortedByDescending { it.second.size }
-
-        if (artistGroups.isEmpty()) return emptyList()
-
-        // Daily Mix 01: Top Artists Cluster
-        val topArtist1 = artistGroups.getOrNull(0)
-        val topArtist2 = artistGroups.getOrNull(1)
-        if (topArtist1 != null) {
-            val tracks = (topArtist1.second + (topArtist2?.second ?: emptyList())).shuffled().take(30).map { it.toTrackItem() }
-            val reasonText = topArtist1.first + (topArtist2?.let { ", " + it.first } ?: "")
-            mixes.add(
-                DailyMix(
-                    id = "dm_1",
-                    title = "Daily Mix 1",
-                    reason = reasonText,
-                    tracks = tracks,
-                    colors = listOf(0xFF4F46E5, 0xFF06B6D4)
-                )
+    private fun buildRealDailyMixes(
+        cachedTracks: List<CachedTrack>,
+        history: List<RecentTrack>
+    ): List<DailyMix> {
+        val historyCounts = history.groupingBy { it.ratingKey }.eachCount()
+        val ranked = cachedTracks
+            .map { track -> track to (track.playCount + (historyCounts[track.ratingKey] ?: 0)) }
+            .filter { it.second > 0 }
+            .sortedWith(
+                compareByDescending<Pair<CachedTrack, Int>> { it.second }
+                    .thenByDescending { it.first.lastPlayedAt ?: 0L }
+                    .thenBy { it.first.ratingKey }
             )
-        }
 
-        // Daily Mix 02: Ambient, sound tracks or game music if exists, otherwise other artists
-        val secondaryArtist = artistGroups.getOrNull(2)
-        val thirdArtist = artistGroups.getOrNull(3)
-        if (secondaryArtist != null) {
-            val tracks = (secondaryArtist.second + (thirdArtist?.second ?: emptyList())).shuffled().take(30).map { it.toTrackItem() }
-            val reasonText = secondaryArtist.first + (thirdArtist?.let { ", " + it.first } ?: "")
-            mixes.add(
-                DailyMix(
-                    id = "dm_2",
-                    title = "Daily Mix 2",
-                    reason = reasonText,
-                    tracks = tracks,
-                    colors = listOf(0xFF8B5CF6, 0xFFEC4899)
-                )
+        // A library catalogue is not listening history. Do not manufacture
+        // five "personalized" mixes from whichever artists happen to be first
+        // in the cache when there is no play signal to rank from.
+        if (ranked.isEmpty()) return emptyList()
+
+        val topArtists = ranked
+            .groupBy { it.first.effectiveAlbumArtist() }
+            .mapValues { (_, tracks) -> tracks.sumOf { it.second } }
+            .entries
+            .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
+            .take(4)
+            .map { it.key }
+        val tracks = ranked
+            .filter { it.first.effectiveAlbumArtist() in topArtists }
+            .take(30)
+            .map { it.first.toTrackItem() }
+        if (tracks.isEmpty()) return emptyList()
+
+        return listOf(
+            DailyMix(
+                id = "history-mix",
+                title = context.getString(R.string.home_mix_listening_history_title),
+                reason = context.getString(
+                    R.string.home_mix_listening_history_reason,
+                    topArtists.joinToString(", ")
+                ),
+                tracks = tracks,
+                colors = listOf(0xFF4F46E5, 0xFF06B6D4)
             )
-        }
-
-        // Daily Mix 03: Diverse eclectic mix from remaining library
-        val remainingTracks = cachedTracks.shuffled().take(40).map { it.toTrackItem() }
-        if (remainingTracks.isNotEmpty()) {
-            mixes.add(
-                DailyMix(
-                    id = "dm_3",
-                    title = "Daily Mix 3",
-                    reason = "Eclectic selection of local gems",
-                    tracks = remainingTracks,
-                    colors = listOf(0xFFEF4444, 0xFFF59E0B)
-                )
-            )
-        }
-
-        // Fill the remaining mix slots with deterministic, disjoint slices of
-        // the indexed catalog. Never claim these are favorites unless history
-        // actually supplied that signal, and never use fabricated tracks.
-        while (mixes.size < 5) {
-            val idx = mixes.size + 1
-            val fallbackTracks = cachedTracks.shuffled()
-                .take(30)
-                .map { it.toTrackItem() }
-            if (fallbackTracks.isEmpty()) break
-            val artists = fallbackTracks.map { it.artist }.distinct().take(3)
-            mixes.add(
-                DailyMix(
-                    id = "dm_$idx",
-                    title = "Daily Mix $idx",
-                    reason = artists.joinToString(", ").ifBlank { "Indexed library tracks" },
-                    tracks = fallbackTracks,
-                    colors = when (idx) {
-                        4 -> listOf(0xFF10B981, 0xFF06B6D4)
-                        else -> listOf(0xFF6366F1, 0xFF8B5CF6)
-                    }
-                )
-            )
-        }
-
-        return mixes
+        )
     }
 
     private fun buildRealJumpBackIn(
@@ -349,57 +323,50 @@ class HomeRecommendationEngine(private val context: Context) {
         val items = mutableListOf<JumpBackInItem>()
         
         // Use historical albums
-        val uniqueAlbums = history.map { it.album to it }.distinctBy { it.first }
-        uniqueAlbums.take(4).forEach { (_, recent) ->
+        val uniqueAlbums = history.map { recent ->
+            val albumArtist = cachedTracks.firstOrNull { it.ratingKey == recent.ratingKey }?.effectiveAlbumArtist() ?: recent.artist
+            (albumArtist to recent.album) to recent
+        }.distinctBy { it.first }
+        uniqueAlbums.take(4).forEach { (albumIdentity, recent) ->
+            val albumKey = albumNavigationKey(albumIdentity.first, albumIdentity.second)
             items.add(
                 JumpBackInItem(
-                    id = "jbi_alb_${albumNavigationKey(recent.artist, recent.album)}",
+                    id = "jbi_alb_$albumKey",
                     title = recent.album,
-                    subtitle = recent.artist,
+                    subtitle = albumIdentity.first,
                     thumb = recent.thumb,
                     type = "album",
-                    extraData = albumNavigationKey(recent.artist, recent.album)
+                    extraData = albumKey
                 )
             )
         }
 
-        // Add deterministic artist shortcuts from the cached catalog.
-        val uniqueArtists = cachedTracks.map { it.artist }.distinct().sorted().take(2)
-        uniqueArtists.forEach { artistName ->
-            val match = cachedTracks.firstOrNull { it.artist == artistName }
-            if (match != null) {
-                items.add(
-                    JumpBackInItem(
-                        id = "jbi_art_${match.ratingKey}",
-                        title = artistName,
-                        subtitle = "Artist",
-                        thumb = match.thumb,
-                        type = "artist",
-                        extraData = artistName
-                    )
-                )
-            }
-        }
-
-        return items.take(6)
+        // Jump Back In is intentionally history-only. The old artist shortcut
+        // selected the first alphabetical cache entries and looked personalized
+        // even when the listener had never played them. Home now keeps the
+        // album-return shelf as the single album resume surface.
+        return items.take(4)
     }
 
     private fun buildDefaultStations(cachedTracks: List<CachedTrack>): List<RecommendedStation> {
         val stations = mutableListOf(
-            RecommendedStation("st_lib", "Library Radio", "Continuous mix of your self-hosted collection", RadioType.LIBRARY_RADIO, listOf(0xFF4F46E5, 0xFF06B6D4)),
-            RecommendedStation("st_art", "Artist Radio", "Build a station around a real Plex artist", RadioType.ARTIST_RADIO, listOf(0xFF8B5CF6, 0xFFEC4899)),
-            RecommendedStation("st_deep", "Deep Cuts Radio", "Unearth rare, lesser-played library files", RadioType.DEEP_CUTS, listOf(0xFF10B981, 0xFF3B82F6)),
-            RecommendedStation("st_forgotten", "Forgotten Favorites", "Played before, not heard again recently", RadioType.FORGOTTEN_FAVORITES, listOf(0xFFF97316, 0xFFEF4444)),
-            RecommendedStation("st_rand", "Random Album Radio", "Plays full albums entirely at random", RadioType.RANDOM_ALBUM, listOf(0xFF6366F1, 0xFF8B5CF6)),
-            RecommendedStation("st_genre", "Genre Radio", "Play tracks with a real Plex genre tag", RadioType.GENRE_RADIO, listOf(0xFF06B6D4, 0xFF3B82F6)),
-            RecommendedStation("st_mood", "Mood Radio", "Filter your library by real genre tags", RadioType.MOOD_RADIO, listOf(0xFF06B6D4, 0xFF3B82F6)),
-            RecommendedStation("st_decade", "Decade Radio", "Songs from a selected release decade", RadioType.DECADE_RADIO, listOf(0xFFEC4899, 0xFFF59E0B)),
-            RecommendedStation("st_collection", "Collection Radio", "Play music from a Plex collection", RadioType.COLLECTION_RADIO, listOf(0xFF8B5CF6, 0xFFEC4899)),
-            RecommendedStation("st_sound", "Soundtrack Radio", "Soundtracks, games, and cinematic tracks", RadioType.SOUNDTRACK_RADIO, listOf(0xFF14B8A6, 0xFF6366F1)),
-            RecommendedStation("st_added", "Recently Added Radio", "The newest music in your Plex library", RadioType.RECENTLY_ADDED_RADIO, listOf(0xFF0EA5E9, 0xFF14B8A6)),
-            RecommendedStation("st_day", "On This Day Radio", "Music added to your library on this date", RadioType.ON_THIS_DAY, listOf(0xFFF97316, 0xFFEC4899))
+            RecommendedStation("st_lib", "Library Radio", context.getString(R.string.station_description_library), RadioType.LIBRARY_RADIO, listOf(0xFF4F46E5, 0xFF06B6D4)),
+            RecommendedStation("st_art", "Artist Radio", context.getString(R.string.station_description_artist), RadioType.ARTIST_RADIO, listOf(0xFF8B5CF6, 0xFFEC4899)),
+            RecommendedStation("st_deep", "Deep Cuts Radio", context.getString(R.string.station_description_deep_cuts), RadioType.DEEP_CUTS, listOf(0xFF10B981, 0xFF3B82F6)),
+            RecommendedStation("st_forgotten", "Forgotten Favorites", context.getString(R.string.station_description_forgotten), RadioType.FORGOTTEN_FAVORITES, listOf(0xFFF97316, 0xFFEF4444)),
+            RecommendedStation("st_rand", "Random Album Radio", context.getString(R.string.station_description_random_album), RadioType.RANDOM_ALBUM, listOf(0xFF6366F1, 0xFF8B5CF6)),
+            RecommendedStation("st_genre", "Genre Radio", context.getString(R.string.station_description_genre), RadioType.GENRE_RADIO, listOf(0xFF06B6D4, 0xFF3B82F6)),
+            RecommendedStation("st_mood", "Mood Radio", context.getString(R.string.station_description_mood), RadioType.MOOD_RADIO, listOf(0xFF06B6D4, 0xFF3B82F6)),
+            RecommendedStation("st_decade", "Decade Radio", context.getString(R.string.station_description_decade), RadioType.DECADE_RADIO, listOf(0xFFEC4899, 0xFFF59E0B)),
+            RecommendedStation("st_collection", "Collection Radio", context.getString(R.string.station_description_collection), RadioType.COLLECTION_RADIO, listOf(0xFF8B5CF6, 0xFFEC4899)),
+            RecommendedStation("st_sound", "Soundtrack Radio", context.getString(R.string.station_description_soundtrack), RadioType.SOUNDTRACK_RADIO, listOf(0xFF14B8A6, 0xFF6366F1)),
+            RecommendedStation("st_added", "Recently Added Radio", context.getString(R.string.station_description_recently_added), RadioType.RECENTLY_ADDED_RADIO, listOf(0xFF0EA5E9, 0xFF14B8A6)),
+            RecommendedStation("st_day", "On This Day Radio", context.getString(R.string.station_description_on_this_day), RadioType.ON_THIS_DAY, listOf(0xFFF97316, 0xFFEC4899))
         )
+        val tagService = LocalMetadataTagService()
         val hasGenreMetadata = cachedTracks.any { it.genres.isNotBlank() }
+        val hasMoodTags = cachedTracks.any { tagService.tag(it).moods.isNotEmpty() }
+        val hasStyleTags = cachedTracks.any { tagService.tag(it).styleTags.isNotEmpty() }
         val hasCollectionMetadata = cachedTracks.any { it.collections.isNotBlank() }
         val hasYearMetadata = cachedTracks.any { it.year != null }
         val hasSoundtrackMetadata = cachedTracks.any {
@@ -430,8 +397,8 @@ class HomeRecommendationEngine(private val context: Context) {
                 RadioType.FORGOTTEN_FAVORITES -> hasPlayedTracks
                 RadioType.TIME_TRAVEL,
                 RadioType.DECADE_RADIO -> hasYearMetadata
-                RadioType.MOOD_RADIO,
-                RadioType.STYLE_RADIO,
+                RadioType.MOOD_RADIO -> hasMoodTags
+                RadioType.STYLE_RADIO -> hasStyleTags
                 RadioType.GENRE_RADIO -> hasGenreMetadata
                 RadioType.COLLECTION_RADIO -> hasCollectionMetadata
                 RadioType.SOUNDTRACK_RADIO -> hasSoundtrackMetadata
@@ -442,78 +409,36 @@ class HomeRecommendationEngine(private val context: Context) {
         }
     }
 
-    private fun buildRealMadeForYou(cachedTracks: List<CachedTrack>): List<MadeForYouItem> {
-        val list = mutableListOf<MadeForYouItem>()
-
-        // Look for heavy/rock keywords
-        val heavyTracks = cachedTracks.filter { 
-            it.artist.contains("Metal", true) || it.title.contains("Rock", true) || it.artist.contains("Horizon", true) 
-        }
-        if (heavyTracks.size >= 5) {
-            list.add(
-                MadeForYouItem(
-                    id = "mfy_heavy",
-                    title = "Heavy & Energetic Mix",
-                    description = "Bracing riffs and powerful beats from your library",
-                    artists = heavyTracks.map { it.artist }.distinct().take(4),
-                    tracks = heavyTracks.sortedBy { it.ratingKey }.take(30).map { it.toTrackItem() },
-                    thumb = heavyTracks.first().thumb
-                )
-            )
-        }
-
-        // Look for chill/cinematic keywords
-        val ambientTracks = cachedTracks.filter { 
-            it.artist.contains("Zimmer", true) || it.title.contains("Theme", true) || it.album.contains("Soundtrack", true) || it.album.contains("OST", true)
-        }
-        if (ambientTracks.size >= 5) {
-            list.add(
-                MadeForYouItem(
-                    id = "mfy_cinematic",
-                    title = "Cinematic Soundtrack Mix",
-                    description = "Epic orchestral themes and background scores",
-                    artists = ambientTracks.map { it.artist }.distinct().take(4),
-                    tracks = ambientTracks.sortedBy { it.ratingKey }.take(30).map { it.toTrackItem() },
-                    thumb = ambientTracks.first().thumb
-                )
-            )
-        }
-
-        // Generic custom mix
-        val favoriteRanking = cachedTracks.sortedWith(compareByDescending<CachedTrack> { it.playCount }.thenBy { it.ratingKey })
-        if (favoriteRanking.size >= 5) {
-            list.add(
-                MadeForYouItem(
-                    id = "mfy_fav",
-                    title = "Personal Favorites Mix",
-                    description = "Your absolute most-cherished home tracks combined",
-                    artists = favoriteRanking.map { it.artist }.distinct().take(4),
-                    tracks = favoriteRanking.take(30).map { it.toTrackItem() },
-                    thumb = favoriteRanking.first().thumb
-                )
-            )
-        }
-
-        return list
+    private fun buildRealMadeForYou(_cachedTracks: List<CachedTrack>): List<MadeForYouItem> {
+        // Made-for-you rows need the companion's CLAP/taxonomy/recommendation
+        // pipeline. The phone-side cache has catalogue metadata and play counts,
+        // but not enough signal to label keyword buckets as personal taste.
+        return emptyList()
     }
 
-    private fun buildRealAlbumShelves(cachedTracks: List<CachedTrack>): List<AlbumRecommendationShelf> {
+    private fun buildRealAlbumShelves(
+        cachedTracks: List<CachedTrack>,
+        recentlyAdded: List<PlexMetadata>
+    ): List<AlbumRecommendationShelf> {
         val groups = cachedTracks
             .filter { it.album.isNotBlank() }
-            .groupBy { "${it.artist}\u0000${it.album}" }
-            .mapValues { (_, tracks) -> tracks.sortedWith(compareBy<CachedTrack> { it.title }.thenBy { it.ratingKey }) }
+            .groupBy { "${it.effectiveAlbumArtist()}\u0000${it.album}" }
+            .mapValues { (_, tracks) -> sortCachedTracksInPlaybackOrder(tracks) }
         val used = mutableSetOf<String>()
+        val recentlyAddedKeys = recentlyAdded.mapNotNull { album ->
+            "${album.homeAlbumArtist()}\u0000${album.title}"
+        }.toSet()
 
         fun shelf(id: String, title: String, reason: String, candidates: List<Pair<String, List<CachedTrack>>>): AlbumRecommendationShelf? {
             val albums = candidates.asSequence()
-                .filter { (key, _) -> used.add(key) }
+                .filter { (key, _) -> key !in recentlyAddedKeys && used.add(key) }
                 .take(8)
                 .map { (key, tracks) ->
                     val first = tracks.first()
                     AlbumRecommendation(
-                        id = albumNavigationKey(first.artist, first.album),
+                        id = albumNavigationKey(first.effectiveAlbumArtist(), first.album),
                         title = first.album,
-                        artist = first.artist,
+                        artist = first.effectiveAlbumArtist(),
                         thumb = first.thumb,
                         year = first.year,
                         tracks = tracks.map { it.toTrackItem() }
@@ -524,83 +449,79 @@ class HomeRecommendationEngine(private val context: Context) {
 
         val entries = groups.entries.map { it.key to it.value }
         val shelves = mutableListOf<AlbumRecommendationShelf>()
-        shelf("albums-recent", "Recently added albums", "Albums added most recently to your library.", entries.sortedByDescending { entry -> entry.second.maxOfOrNull { it.addedAt ?: 0L } ?: 0L })?.let(shelves::add)
-        shelf("albums-unplayed", "Unplayed albums", "Full albums waiting for a first listen.", entries.filter { entry -> entry.second.all { it.playCount == 0 } }.sortedBy { it.first })?.let(shelves::add)
-        shelf("albums-familiar", "Albums you return to", "Your most-played albums, kept together for an album-length listen.", entries.sortedByDescending { entry -> entry.second.sumOf { it.playCount } })?.let(shelves::add)
-        shelf("albums-collections", "Soundtracks and collections", "Distinct collection shelves from your library metadata.", entries.filter { entry -> entry.second.any { it.collections.contains("soundtrack", true) || it.genres.contains("soundtrack", true) || it.album.contains("OST", true) } }.sortedBy { it.first })?.let(shelves::add)
-
-        // Keep this as an album shelf. Rendering its tracks through the generic
-        // MoreFromSection makes every song look like a separate album tile.
-        val albumsForDiscovery = entries.sortedBy { it.first }
-        if (albumsForDiscovery.isNotEmpty()) {
-            val selected = albumsForDiscovery[deterministicDailyIndex(albumsForDiscovery.size, System.currentTimeMillis())]
-            val first = selected.second.first()
-            shelves += AlbumRecommendationShelf(
-                id = "albums-random",
-                title = "Random Album Discovery",
-                reason = "One complete album selected from your indexed library.",
-                albums = listOf(
-                    AlbumRecommendation(
-                        id = albumNavigationKey(first.artist, first.album),
-                        title = first.album,
-                        artist = first.artist,
-                        thumb = first.thumb,
-                        year = first.year,
-                        tracks = selected.second.map { it.toTrackItem() }
-                    )
-                )
-            )
+        // Recently Added is already a dedicated album row. Keeping it out of
+        // this shelf list prevents the same albums from appearing twice.
+        if (cachedTracks.any { it.addedAt != null }) {
+            shelf(
+                "albums-unplayed",
+                context.getString(R.string.home_album_shelf_unplayed_title),
+                context.getString(R.string.home_album_shelf_unplayed_reason),
+                entries
+                    .filter { (key, tracks) -> key !in recentlyAddedKeys && tracks.all { it.playCount == 0 } }
+                    .sortedWith(compareByDescending<Pair<String, List<CachedTrack>>> { entry ->
+                        entry.second.maxOfOrNull { it.addedAt ?: 0L } ?: 0L
+                    }.thenBy { it.first })
+            )?.let(shelves::add)
         }
+        shelf(
+            "albums-familiar",
+            context.getString(R.string.home_album_shelf_return_title),
+            context.getString(R.string.home_album_shelf_return_reason),
+            entries
+                .filter { (_, tracks) -> tracks.sumOf { it.playCount } > 0 }
+                .sortedWith(compareByDescending<Pair<String, List<CachedTrack>>> { entry ->
+                    entry.second.sumOf { it.playCount }
+                }.thenByDescending { entry -> entry.second.maxOfOrNull { it.lastPlayedAt ?: 0L } ?: 0L }
+                    .thenBy { it.first })
+        )?.let(shelves::add)
+        shelf(
+            "albums-collections",
+            context.getString(R.string.home_album_shelf_collection_title),
+            context.getString(R.string.home_album_shelf_collection_reason),
+            entries.filter { (_, tracks) ->
+                tracks.any {
+                    it.collections.contains("soundtrack", true) ||
+                        it.genres.contains("soundtrack", true) ||
+                        it.album.contains("OST", true)
+                }
+            }.sortedBy { it.first }
+        )?.let(shelves::add)
         return shelves
     }
 
-    private fun buildRealMoreFromSections(cachedTracks: List<CachedTrack>): List<MoreFromSection> {
+    private fun buildRealMoreFromSections(
+        cachedTracks: List<CachedTrack>,
+        history: List<RecentTrack>
+    ): List<MoreFromSection> {
         val sections = mutableListOf<MoreFromSection>()
-        val explanationService = RecommendationExplanationService()
+        val explanationService = RecommendationExplanationService(context)
         val nowSeconds = System.currentTimeMillis() / 1000L
-        
-        // Group by artist
-        val artistGroups = cachedTracks.groupBy { it.artist }
-            .toList()
-            .filter { it.second.size >= 3 }
-            .sortedBy { it.first }
-
-        artistGroups.take(2).forEach { (artistName, tracks) ->
-            sections.add(
-                MoreFromSection(
-                    title = "More from $artistName",
-                    type = "artist",
-                    tracks = tracks.sortedBy { it.ratingKey }.take(8).map { it.toTrackItem() }
-                )
-            )
-        }
+        val historyCounts = history.groupingBy { it.ratingKey }.eachCount()
+        val historyLastPlayed = history.groupBy { it.ratingKey }
+            .mapValues { (_, tracks) -> tracks.maxOfOrNull { it.timestamp } ?: 0L }
+        fun playCount(track: CachedTrack): Int = track.playCount + (historyCounts[track.ratingKey] ?: 0)
+        fun lastPlayedAt(track: CachedTrack): Long = maxOf(track.lastPlayedAt ?: 0L, historyLastPlayed[track.ratingKey] ?: 0L) / 1000L
 
         val forgotten = cachedTracks
-            .filter { it.playCount > 0 && (it.lastPlayedAt == null || it.lastPlayedAt < nowSeconds - 30L * 24L * 60L * 60L) }
-            .sortedWith(compareByDescending<CachedTrack> { it.playCount }.thenBy { it.ratingKey })
+            .filter { playCount(it) > 0 && lastPlayedAt(it) < nowSeconds - 30L * 24L * 60L * 60L }
+            .sortedWith(compareByDescending<CachedTrack> { playCount(it) }.thenByDescending { lastPlayedAt(it) }.thenBy { it.ratingKey })
             .take(12)
         if (forgotten.isNotEmpty()) {
-            val title = "Forgotten Favorites"
-            sections.add(MoreFromSection(title, "history", forgotten.map { it.toTrackItem() }, explanationService.explainShelf(title, forgotten).text))
+            val title = context.getString(R.string.home_more_forgotten_title)
+            sections.add(MoreFromSection(title, "history", forgotten.map { it.toTrackItem() }, explanationService.explainShelf("forgotten", forgotten).text))
         }
 
-        val recentlyAddedBarelyPlayed = cachedTracks
-            .filter { it.addedAt != null && it.addedAt > nowSeconds - 30L * 24L * 60L * 60L && it.playCount == 0 }
-            .sortedWith(compareByDescending<CachedTrack> { it.addedAt }.thenBy { it.ratingKey })
-            .take(12)
-        if (recentlyAddedBarelyPlayed.isNotEmpty()) {
-            val title = "Recently Added, Barely Played"
-            sections.add(MoreFromSection(title, "recent", recentlyAddedBarelyPlayed.map { it.toTrackItem() }, explanationService.explainShelf(title, recentlyAddedBarelyPlayed).text))
-        }
-
-        val familiarArtists = cachedTracks.filter { it.playCount > 0 }.map { it.artist }.toSet()
+        val familiarArtists = cachedTracks
+            .filter { playCount(it) > 0 }
+            .map { it.effectiveAlbumArtist() }
+            .toSet()
         val deepCuts = cachedTracks
-            .filter { it.artist in familiarArtists && it.playCount == 0 }
-            .sortedWith(compareBy<CachedTrack> { it.artist }.thenBy { it.album }.thenBy { it.ratingKey })
+            .filter { it.effectiveAlbumArtist() in familiarArtists && playCount(it) == 0 }
+            .sortedWith(compareBy<CachedTrack> { it.effectiveAlbumArtist() }.thenBy { it.album }.thenBy { it.ratingKey })
             .take(12)
         if (deepCuts.isNotEmpty()) {
-            val title = "Deep Cuts From Familiar Artists"
-            sections.add(MoreFromSection(title, "discovery", deepCuts.map { it.toTrackItem() }, explanationService.explainShelf(title, deepCuts).text))
+            val title = context.getString(R.string.home_more_deep_cuts_title)
+            sections.add(MoreFromSection(title, "discovery", deepCuts.map { it.toTrackItem() }, explanationService.explainShelf("deep-cuts", deepCuts).text))
         }
 
         val soundtrack = cachedTracks
@@ -608,8 +529,8 @@ class HomeRecommendationEngine(private val context: Context) {
             .sortedBy { it.ratingKey }
             .take(12)
         if (soundtrack.isNotEmpty()) {
-            val title = "Soundtracks and Game Music"
-            sections.add(MoreFromSection(title, "collection", soundtrack.map { it.toTrackItem() }, explanationService.explainShelf(title, soundtrack).text))
+            val title = context.getString(R.string.home_more_soundtracks_title)
+            sections.add(MoreFromSection(title, "collection", soundtrack.map { it.toTrackItem() }, explanationService.explainShelf("soundtrack", soundtrack).text))
         }
 
         return sections
@@ -656,12 +577,14 @@ class HomeRecommendationEngine(private val context: Context) {
 
         return OnThisDayItem(
             title = track.album,
-            artist = track.artist,
+            artist = track.effectiveAlbumArtist(),
             year = selectedYear,
             timeAgo = if (yearsAgo > 0) "$yearsAgo years ago" else "Added a year ago",
             thumb = track.thumb,
-            tracks = cachedTracks.filter { it.album == track.album }.map { it.toTrackItem() },
-            matchReason = "This classic was released back in $selectedYear. Relive the original self-hosted experience!"
+            tracks = cachedTracks.filter {
+                it.album == track.album && it.effectiveAlbumArtist() == track.effectiveAlbumArtist()
+            }.let(::sortCachedTracksInPlaybackOrder).map { it.toTrackItem() },
+            matchReason = context.getString(R.string.home_on_this_day_added_reason)
         )
     }
 
@@ -672,10 +595,13 @@ class HomeRecommendationEngine(private val context: Context) {
         if (recentlyAdded.isEmpty()) return emptyList()
 
         return recentlyAdded.take(5).map { album ->
-            val albumTracks = cachedTracks.filter { it.album == album.title }.sortedBy { it.ratingKey }.map { it.toTrackItem() }
+            val albumArtist = album.homeAlbumArtist()
+            val albumTracks = cachedTracks.filter {
+                it.album == album.title && it.effectiveAlbumArtist() == albumArtist
+            }.let(::sortCachedTracksInPlaybackOrder).map { it.toTrackItem() }
             NewReleaseItem(
                 title = album.title,
-                artist = album.parentTitle ?: "Various Artists",
+                artist = albumArtist,
                 year = album.year ?: Calendar.getInstance().get(Calendar.YEAR),
                 thumb = album.thumb ?: "",
                 tracks = albumTracks
@@ -893,6 +819,10 @@ fun CachedTrack.toTrackItem(): TrackItem {
         thumb = this.thumb,
         duration = this.duration,
         genres = this.genres.split('|').map { it.trim() }.filter { it.isNotEmpty() },
-        albumRatingKey = albumNavigationKey(this.artist, this.album)
+        albumRatingKey = albumNavigationKey(this.effectiveAlbumArtist(), this.album),
+        albumArtist = this.effectiveAlbumArtist(),
+        artistRatingKey = artistNavigationKey(this.effectiveAlbumArtist()),
+        index = this.index,
+        discNumber = this.discNumber
     )
 }

@@ -1,5 +1,7 @@
 package com.example
 
+import com.example.data.PlaylistTrackEntity
+import com.example.data.toTrackItem
 import com.example.playback.TrackItem
 import com.example.sync.spotCoreTrackId
 import org.junit.Assert.assertEquals
@@ -40,5 +42,21 @@ class CompanionTrackIdentityTest {
                 1000
             ).spotCoreTrackId()
         )
+    }
+
+    @Test
+    fun playlistTracksKeepTheCompanionIdWhenConvertedForSync() {
+        val playlistTrack = PlaylistTrackEntity(
+            playlistId = 1,
+            ratingKey = "ignored-local-key",
+            title = "Song",
+            artist = "Artist",
+            album = "Album",
+            key = "http://spotcore.local:4182/api/v1/media/stream/song-3",
+            thumb = "",
+            duration = 1000
+        )
+
+        assertEquals("song-3", playlistTrack.toTrackItem().spotCoreTrackId())
     }
 }

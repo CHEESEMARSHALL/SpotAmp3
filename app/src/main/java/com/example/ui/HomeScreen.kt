@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -25,7 +26,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.error
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -35,15 +46,21 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.example.data.*
+import com.example.R
 import com.example.playback.TrackItem
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalFoundationApi::class)
 private fun Modifier.homeTileGesture(
+    onClickLabel: String,
+    onLongClickLabel: String,
     onClick: () -> Unit,
     onLongClick: () -> Unit
 ): Modifier = combinedClickable(
+    onClickLabel = onClickLabel,
+    role = Role.Button,
     onClick = onClick,
+    onLongClickLabel = onLongClickLabel,
     onLongClick = onLongClick
 )
 
@@ -51,6 +68,7 @@ private fun Modifier.homeTileGesture(
 fun HomeScreen(
     viewModel: MusicViewModel,
     onNavigateToSettings: () -> Unit,
+    onStartPairing: () -> Unit,
     onNavigateToArtist: (String, String) -> Unit,
     onNavigateToAlbum: (String, String) -> Unit,
     onNavigateToCustomPlaylist: (String, String, String, String, List<TrackItem>, List<Long>) -> Unit,
@@ -59,20 +77,23 @@ fun HomeScreen(
     },
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     val isConfigured by viewModel.isConfigured.collectAsStateWithLifecycle()
     val selectedLibraryName by viewModel.selectedLibraryName.collectAsStateWithLifecycle()
     val homeFeedState by viewModel.homeFeedState.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+    val isLoadingRecentlyAdded by viewModel.isLoadingRecentlyAdded.collectAsStateWithLifecycle()
+    val recentlyAddedLoadError by viewModel.recentlyAddedLoadError.collectAsStateWithLifecycle()
+    val baseUrl by viewModel.baseUrlFlow.collectAsStateWithLifecycle()
+    val token by viewModel.tokenFlow.collectAsStateWithLifecycle()
     val cachedCount by viewModel.cachedCount.collectAsStateWithLifecycle()
-    val errorMessage by viewModel.errorMessage.collectAsStateWithLifecycle()
-
-    val coroutineScope = rememberCoroutineScope()
+    val generalErrorMessage by viewModel.errorMessage.collectAsStateWithLifecycle()
+    val homeFeedFailure by viewModel.homeFeedFailure.collectAsStateWithLifecycle()
+    val companionConfigured by viewModel.companionConfigured.collectAsStateWithLifecycle()
+    val companionConnectionStatus by viewModel.companionConnectionStatus.collectAsStateWithLifecycle()
+    val showFirstRunPairing = !isConfigured && cachedCount == 0
 
     var activeContextMenu by remember { mutableStateOf<ContextMenuItem?>(null) }
-    var selectedStation by remember { mutableStateOf<RecommendedStation?>(null) }
-    var activePremiumScreen by remember { mutableStateOf<RecommendedStation?>(null) }
-    val baseUrl = viewModel.repository.settings.baseUrl
-    val token = viewModel.repository.settings.token
 
     Box(
         modifier = modifier
@@ -87,17 +108,33 @@ fun HomeScreen(
             verticalArrangement = Arrangement.spacedBy(28.dp)
         ) {
             // 1. Personalized Header Row
-            item {
+            item(key = "header") {
                 HomeHeader(
                     libraryName = selectedLibraryName,
                     isConfigured = isConfigured,
+                    hasConnectionError = homeFeedFailure != null,
+                    hasCachedMusic = cachedCount > 0,
                     source = homeFeedState.source,
-                    onNavigateToSettings = onNavigateToSettings
+                    onNavigateToSettings = onNavigateToSettings,
+                    companionConfigured = companionConfigured,
+                    connectionStatus = companionConnectionStatus,
+                    showPairingGuidance = !showFirstRunPairing
                 )
             }
 
+            if (showFirstRunPairing) {
+                item(key = "first_run_pairing") {
+                    HomeEmptyState(
+                        isConfigured = false,
+                        hasCachedMusic = false,
+                        onNavigateToSettings = onNavigateToSettings,
+                        onStartPairing = onStartPairing
+                    )
+                }
+            }
+
             homeFeedState.dailyMixes.firstOrNull()?.let { spotlight ->
-                item {
+                item(key = "spotlight") {
                     HomeSpotlight(
                         mix = spotlight,
                         source = homeFeedState.source,
@@ -109,7 +146,7 @@ fun HomeScreen(
                                 "daily_mix",
                                 spotlight.id,
                                 spotlight.title,
-                                spotlight.description,
+                                context.getString(R.string.home_mix_based_on_reason, spotlight.reason),
                                 spotlight.tracks,
                                 spotlight.colors
                             )
@@ -118,31 +155,27 @@ fun HomeScreen(
                 }
             }
 
-            // Connection Check Banner (if no backend is configured)
-            if (!isConfigured) {
-                item {
-                    UnconfiguredBanner(onNavigateToSettings = onNavigateToSettings)
-                }
-            }
-
-            errorMessage?.let { message ->
-                item {
-                    HomeErrorBanner(
-                        message = message,
-                        onNavigateToSettings = onNavigateToSettings
+            if (homeFeedFailure != null || generalErrorMessage != null) {
+                item(key = "home_error_banners") {
+                    HomeRecoveryBanners(
+                        homeFeedFailure = homeFeedFailure,
+                        actionErrorMessage = generalErrorMessage,
+                        onRetryHomeFeed = viewModel::retryHomeFeed,
+                        onNavigateToSettings = onNavigateToSettings,
+                        onDismissActionError = viewModel::clearActionErrorMessage
                     )
                 }
             }
 
             // Skeleton Loading State
             if (isLoading && homeFeedState.recentPlays.isEmpty()) {
-                item {
+                item(key = "skeleton") {
                     HomeSkeletonLoader()
                 }
             } else {
                 // SECTION 1: RECENT PLAYS (Dynamic Horizontal Cards)
                 if (homeFeedState.recentPlays.isNotEmpty()) {
-                    item {
+                    item(key = "recent_plays") {
                         RecentPlaysSection(
                             recentPlays = homeFeedState.recentPlays,
                             baseUrl = baseUrl,
@@ -163,7 +196,9 @@ fun HomeScreen(
                                         key = track.key,
                                         thumb = track.thumb,
                                         duration = track.duration,
-                                        albumRatingKey = track.albumRatingKey
+                                        albumRatingKey = track.albumRatingKey,
+                                        albumArtist = track.albumArtist,
+                                        artistRatingKey = track.artistRatingKey
                                     )
                                 }
                             }
@@ -172,8 +207,23 @@ fun HomeScreen(
                 }
 
                 // SECTION 2: RECENTLY ADDED ALBUMS (Horizontally Scrolling Cards)
+                if (recentlyAddedLoadError != null) {
+                    item(key = "recently_added_error") {
+                        HomeErrorBanner(
+                            message = requireNotNull(recentlyAddedLoadError),
+                            onNavigateToSettings = onNavigateToSettings,
+                            onRetry = viewModel::loadRecentlyAdded,
+                            isRetrying = isLoadingRecentlyAdded
+                        )
+                    }
+                } else if (isLoadingRecentlyAdded && !companionConfigured && homeFeedState.recentlyAdded.isEmpty()) {
+                    item(key = "recently_added_loading") {
+                        HomeRecentlyAddedLoading()
+                    }
+                }
+
                 if (homeFeedState.recentlyAdded.isNotEmpty()) {
-                    item {
+                    item(key = "recently_added") {
                         RecentlyAddedSection(
                             albums = homeFeedState.recentlyAdded,
                             baseUrl = baseUrl,
@@ -183,7 +233,8 @@ fun HomeScreen(
                                     .asSequence()
                                     .flatMap { it.albums.asSequence() }
                                     .firstOrNull {
-                                        it.title == album.title && it.artist == (album.parentTitle ?: "Various Artists")
+                                        it.title == album.title &&
+                                            it.artist == (album.parentTitle?.takeIf(String::isNotBlank) ?: "Various Artists")
                                     }
                                 if (attachedAlbum != null) {
                                     onNavigateToAlbumWithTracks(
@@ -199,7 +250,7 @@ fun HomeScreen(
                                 activeContextMenu = ContextMenuItem.Album(
                                     ratingKey = album.ratingKey,
                                     title = album.title,
-                                    artist = album.parentTitle ?: "Various Artists",
+                                    artist = album.parentTitle?.takeIf(String::isNotBlank) ?: "Various Artists",
                                     thumb = album.thumb ?: ""
                                 )
                             }
@@ -210,34 +261,39 @@ fun HomeScreen(
                 // Album-first discovery shelves. A tap opens the album detail;
                 // playback stays behind the detail screen's explicit controls.
                 if (homeFeedState.albumShelves.isNotEmpty()) {
-                    homeFeedState.albumShelves.forEach { shelf ->
-                        item {
-                            AlbumRecommendationShelfSection(
-                                shelf = shelf,
-                                baseUrl = baseUrl,
-                                token = token,
-                                onOpenAlbum = { album ->
-                                    onNavigateToAlbumWithTracks(album.id, album.title, album.tracks)
-                                },
-                                onMoreClick = { album ->
-                                    activeContextMenu = ContextMenuItem.Album(
-                                        ratingKey = album.id,
-                                        title = album.title,
-                                        artist = album.artist,
-                                        thumb = album.thumb,
-                                        tracks = album.tracks
-                                    )
-                                }
-                            )
+                    homeFeedState.albumShelves
+                        .filterNot { it.title.startsWith("Daily Mix", ignoreCase = true) }
+                        .forEach { shelf ->
+                            item(key = "shelf_${shelf.id}") {
+                                AlbumRecommendationShelfSection(
+                                    shelf = shelf,
+                                    baseUrl = baseUrl,
+                                    token = token,
+                                    onOpenAlbum = { album ->
+                                        onNavigateToAlbumWithTracks(album.id, album.title, album.tracks)
+                                    },
+                                    onMoreClick = { album ->
+                                        activeContextMenu = ContextMenuItem.Album(
+                                            ratingKey = album.id,
+                                            title = album.title,
+                                            artist = album.artist,
+                                            thumb = album.thumb,
+                                            tracks = album.tracks
+                                        )
+                                    }
+                                )
+                            }
                         }
-                    }
                 }
 
-                // SECTION 3: DAILY MIXES (Gradients, reasons, clusters)
-                if (homeFeedState.dailyMixes.isNotEmpty()) {
-                    item {
+                // The first mix is already rendered as the spotlight above.
+                // Keep it out of the list so the same server recommendation is
+                // not presented twice.
+                val additionalMixes = homeFeedState.dailyMixes.drop(1)
+                if (additionalMixes.isNotEmpty()) {
+                    item(key = "daily_mixes") {
                         DailyMixesSection(
-                            mixes = homeFeedState.dailyMixes,
+                            mixes = additionalMixes,
                             baseUrl = baseUrl,
                             token = token,
                             onMixClick = { mix ->
@@ -245,7 +301,7 @@ fun HomeScreen(
                                     "daily_mix",
                                     mix.id,
                                     mix.title,
-                                    mix.description,
+                                    context.getString(R.string.home_mix_based_on_reason, mix.reason),
                                     mix.tracks,
                                     mix.colors
                                 )
@@ -254,46 +310,9 @@ fun HomeScreen(
                     }
                 }
 
-                // SECTION 4: JUMP BACK IN (Quick resume of items)
-                if (homeFeedState.jumpBackIn.isNotEmpty()) {
-                    item {
-                        JumpBackInSection(
-                            items = homeFeedState.jumpBackIn,
-                            baseUrl = baseUrl,
-                            token = token,
-                            onItemClick = { item ->
-                                when (item.type) {
-                                    "album" -> onNavigateToAlbum(item.id.replace("jbi_alb_", ""), item.title)
-                                    "artist" -> onNavigateToArtist(item.id.replace("jbi_art_", ""), item.title)
-                                    else -> {
-                                        // Trigger custom generated radio/mix for playlist/station
-                                        viewModel.generateAiPlaylist("Build custom mix for ${item.title}")
-                                    }
-                                }
-                            }
-                        )
-                    }
-                }
-
-                // SECTION 5: RECOMMENDED STATIONS (Radio triggers)
-                if (homeFeedState.stations.isNotEmpty()) {
-                    item {
-                        RecommendedStationsSection(
-                            stations = homeFeedState.stations,
-                            onStationClick = { station ->
-                                if (station.type in setOf(RadioType.ARTIST_RADIO, RadioType.ALBUM_RADIO, RadioType.STYLE_RADIO, RadioType.MOOD_RADIO, RadioType.GENRE_RADIO, RadioType.DECADE_RADIO, RadioType.TIME_TRAVEL)) {
-                                    activePremiumScreen = station
-                                } else {
-                                    selectedStation = station
-                                }
-                            }
-                        )
-                    }
-                }
-
-                // SECTION 6: MADE FOR YOU (Heavy core / Soundtracks mixes)
+                // SECTION 4: MADE FOR YOU (Server rows without album payloads)
                 if (homeFeedState.madeForYou.isNotEmpty()) {
-                    item {
+                    item(key = "made_for_you") {
                         MadeForYouSection(
                             madeForYou = homeFeedState.madeForYou,
                             source = homeFeedState.source,
@@ -311,10 +330,10 @@ fun HomeScreen(
                     }
                 }
 
-                // SECTION 7: MORE FROM [GENRE / COLLECTION]
+                // SECTION 6: MORE FROM [GENRE / COLLECTION]
                 if (homeFeedState.moreFromSections.isNotEmpty()) {
                     homeFeedState.moreFromSections.forEach { section ->
-                        item {
+                        item(key = "more_from_${section.title}") {
                             MoreFromSectionLayout(
                                 section = section,
                                 baseUrl = baseUrl,
@@ -331,7 +350,9 @@ fun HomeScreen(
                                         key = track.key,
                                         thumb = track.thumb,
                                         duration = track.duration,
-                                        albumRatingKey = track.albumRatingKey
+                                        albumRatingKey = track.albumRatingKey,
+                                        albumArtist = track.albumArtist,
+                                        artistRatingKey = track.artistRatingKey
                                     )
                                 }
                             )
@@ -339,9 +360,10 @@ fun HomeScreen(
                     }
                 }
 
-                // SECTION 8: MOST PLAYED THIS MONTH
+
+                // SECTION 7: MOST PLAYED THIS MONTH
                 if (homeFeedState.mostPlayedThisMonth.isNotEmpty()) {
-                    item {
+                    item(key = "most_played") {
                         MostPlayedSection(
                             items = homeFeedState.mostPlayedThisMonth,
                             baseUrl = baseUrl,
@@ -358,16 +380,18 @@ fun HomeScreen(
                                     key = trackItem.key,
                                     thumb = trackItem.thumb,
                                     duration = trackItem.duration,
-                                    albumRatingKey = trackItem.albumRatingKey
+                                    albumRatingKey = trackItem.albumRatingKey,
+                                    albumArtist = trackItem.albumArtist,
+                                    artistRatingKey = trackItem.artistRatingKey
                                 )
                             }
                         )
                     }
                 }
 
-                // SECTION 9: ON THIS DAY (Anniversaries / Classics throwback)
+                // SECTION 8: ON THIS DAY (Anniversaries / Classics throwback)
                 homeFeedState.onThisDay?.let { item ->
-                    item {
+                    item(key = "on_this_day") {
                         OnThisDaySection(
                             onThisDay = item,
                             baseUrl = baseUrl,
@@ -381,91 +405,25 @@ fun HomeScreen(
                     }
                 }
 
-                // SECTION 10: NEW RELEASES FOR YOU
-                if (homeFeedState.newReleases.isNotEmpty()) {
-                    item {
-                        NewReleasesSection(
-                            releases = homeFeedState.newReleases,
-                            baseUrl = baseUrl,
-                            token = token,
-                            onReleaseClick = { release ->
-                                onNavigateToAlbumWithTracks(
-                                    albumNavigationKey(release.artist, release.title),
-                                    release.title,
-                                    release.tracks
-                                )
-                            }
-                        )
-                    }
-                }
-
-                // SECTION 11: HISTORY (Recent track list)
-                if (homeFeedState.history.isNotEmpty()) {
-                    item {
-                        HistorySection(
-                            history = homeFeedState.history,
-                            baseUrl = baseUrl,
-                            token = token,
-                            onTrackClick = { recent ->
-                                viewModel.playRecentTrack(recent)
-                            },
-                            onMoreClick = { recent ->
-                                activeContextMenu = ContextMenuItem.Track(
-                                    ratingKey = recent.ratingKey,
-                                    title = recent.title,
-                                    artist = recent.artist,
-                                    album = recent.album,
-                                    key = recent.key,
-                                    thumb = recent.thumb,
-                                    duration = 0L,
-                                    albumRatingKey = albumNavigationKey(recent.artist, recent.album)
-                                )
-                            }
-                        )
-                    }
-                }
-
-                if (homeFeedState.recentPlays.isEmpty() &&
+                if (!showFirstRunPairing &&
+                    homeFeedState.recentPlays.isEmpty() &&
                     homeFeedState.recentlyAdded.isEmpty() &&
                     homeFeedState.albumShelves.isEmpty() &&
                     homeFeedState.dailyMixes.isEmpty() &&
-                    homeFeedState.history.isEmpty()
+                    homeFeedState.madeForYou.isEmpty() &&
+                    homeFeedState.mostPlayedThisMonth.isEmpty() &&
+                    homeFeedState.onThisDay == null
                 ) {
-                    item {
+                    item(key = "empty_state") {
                         HomeEmptyState(
                             isConfigured = isConfigured,
                             hasCachedMusic = cachedCount > 0,
-                            onNavigateToSettings = onNavigateToSettings
+                            onNavigateToSettings = onNavigateToSettings,
+                            onStartPairing = onStartPairing
                         )
                     }
                 }
             }
-        }
-
-        selectedStation?.let { station ->
-            StationDetailsDialog(
-                station = station,
-                viewModel = viewModel,
-                onDismiss = { selectedStation = null },
-                onPlay = { request ->
-                    selectedStation = null
-                    coroutineScope.launch {
-                        val tracks = viewModel.generateRadioTracks(request)
-                        if (tracks.isNotEmpty()) {
-                            onNavigateToCustomPlaylist(
-                                "radio",
-                                "radio_${request.type.name}_${System.currentTimeMillis()}",
-                                station.title,
-                                station.subtitle,
-                                tracks,
-                                station.gradientColors
-                            )
-                        } else {
-                            viewModel.postErrorMessage("No matching tracks found in your offline library cache.")
-                        }
-                    }
-                }
-            )
         }
 
         // Context Menu Overlay Sheet
@@ -480,62 +438,22 @@ fun HomeScreen(
             )
         }
 
-        // Premium Station Selector Screen Overlay
-        AnimatedVisibility(
-            visible = activePremiumScreen != null,
-            enter = slideInVertically(initialOffsetY = { it }) + fadeIn(),
-            exit = slideOutVertically(targetOffsetY = { it }) + fadeOut(),
-            modifier = Modifier.fillMaxSize()
-        ) {
-            activePremiumScreen?.let { station ->
-                when (station.type) {
-                    RadioType.ARTIST_RADIO -> ArtistMixBuilderScreen(
-                        viewModel = viewModel,
-                        baseUrl = baseUrl,
-                        token = token,
-                        onBack = { activePremiumScreen = null },
-                        onNavigateToCustomPlaylist = { type, id, title, desc, tracks, colors ->
-                            activePremiumScreen = null
-                            onNavigateToCustomPlaylist(type, id, title, desc, tracks, colors)
-                        }
-                    )
-                    RadioType.ALBUM_RADIO -> AlbumMixBuilderScreen(
-                        viewModel = viewModel,
-                        baseUrl = baseUrl,
-                        token = token,
-                        onBack = { activePremiumScreen = null },
-                        onNavigateToCustomPlaylist = { type, id, title, desc, tracks, colors ->
-                            activePremiumScreen = null
-                            onNavigateToCustomPlaylist(type, id, title, desc, tracks, colors)
-                        }
-                    )
-                    RadioType.STYLE_RADIO, RadioType.MOOD_RADIO, RadioType.GENRE_RADIO, RadioType.DECADE_RADIO, RadioType.TIME_TRAVEL -> GenericRadioSelectorScreen(
-                        station = station,
-                        viewModel = viewModel,
-                        onBack = { activePremiumScreen = null },
-                        onNavigateToCustomPlaylist = { type, id, title, desc, tracks, colors ->
-                            activePremiumScreen = null
-                            onNavigateToCustomPlaylist(type, id, title, desc, tracks, colors)
-                        }
-                    )
-                    else -> {}
-                }
-            }
-        }
     }
 }
 
 @Composable
-private fun HomeEmptyState(
+internal fun HomeEmptyState(
     isConfigured: Boolean,
     hasCachedMusic: Boolean,
-    onNavigateToSettings: () -> Unit
+    onNavigateToSettings: () -> Unit,
+    onStartPairing: () -> Unit
 ) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.05f)),
+            .padding(horizontal = 16.dp)
+            .testTag("home_empty_state"),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         shape = RoundedCornerShape(20.dp)
     ) {
         Column(
@@ -546,32 +464,48 @@ private fun HomeEmptyState(
             Icon(
                 imageVector = if (hasCachedMusic) Icons.Rounded.CloudOff else Icons.Rounded.LibraryMusic,
                 contentDescription = null,
-                tint = Color.White.copy(alpha = 0.55f),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(42.dp)
             )
             Text(
                 text = when {
-                    !isConfigured && hasCachedMusic -> "Offline library ready"
-                    !isConfigured -> "Connect a music backend to get started"
-                    else -> "Your library is ready to explore"
+                    !isConfigured && hasCachedMusic -> stringResource(R.string.home_offline_ready_title)
+                    !isConfigured -> stringResource(R.string.home_connect_spotcore_title)
+                    !hasCachedMusic -> stringResource(R.string.home_setup_library_title)
+                    else -> stringResource(R.string.home_library_ready_title)
                 },
-                color = Color.White,
+                color = MaterialTheme.colorScheme.onSurface,
                 style = MaterialTheme.typography.titleMedium,
                 textAlign = TextAlign.Center
             )
             Text(
                 text = when {
-                    !isConfigured && hasCachedMusic -> "No Home shelves are available yet, but your cached music remains searchable offline."
-                    !isConfigured -> "Configure SpotCore or Plex, or index music to populate real Home shelves."
-                    else -> "Sync your music library to build real recommendations and history."
+                    !isConfigured && hasCachedMusic -> stringResource(R.string.home_offline_ready_body)
+                    !isConfigured -> stringResource(R.string.home_pairing_body)
+                    !hasCachedMusic -> stringResource(R.string.home_setup_library_body)
+                    else -> stringResource(R.string.home_library_ready_body)
                 },
-                color = Color.White.copy(alpha = 0.6f),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 style = MaterialTheme.typography.bodyMedium,
                 textAlign = TextAlign.Center
             )
             if (!isConfigured) {
-                TextButton(onClick = onNavigateToSettings) {
-                    Text("Open Settings")
+                Button(onClick = onStartPairing, modifier = Modifier.testTag("home_pairing_cta")) {
+                    Icon(Icons.Rounded.QrCodeScanner, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(stringResource(R.string.home_pairing_cta))
+                }
+                TextButton(
+                    onClick = onNavigateToSettings,
+                    modifier = Modifier.heightIn(min = 48.dp).testTag("home_connection_settings_button")
+                ) {
+                    Text(stringResource(R.string.home_connection_settings))
+                }
+            } else if (!hasCachedMusic) {
+                Button(onClick = onNavigateToSettings, modifier = Modifier.testTag("home_setup_library_cta")) {
+                    Icon(Icons.Rounded.Sync, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text(stringResource(R.string.home_setup_library_cta))
                 }
             }
         }
@@ -579,16 +513,21 @@ private fun HomeEmptyState(
 }
 
 @Composable
-private fun HomeErrorBanner(
+internal fun HomeErrorBanner(
     message: String,
-    onNavigateToSettings: () -> Unit
+    technicalDetails: String? = null,
+    onNavigateToSettings: () -> Unit,
+    onRetry: () -> Unit,
+    isRetrying: Boolean = false
 ) {
+    var showingTechnicalDetails by remember(message, technicalDetails) { mutableStateOf(false) }
+    val colors = MaterialTheme.colorScheme
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF7F1D1D).copy(alpha = 0.3f)),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFFCA5A5).copy(alpha = 0.25f)),
+        colors = CardDefaults.cardColors(containerColor = colors.errorContainer),
+        border = androidx.compose.foundation.BorderStroke(1.dp, colors.error.copy(alpha = 0.35f)),
         shape = RoundedCornerShape(16.dp)
     ) {
         Row(
@@ -596,38 +535,189 @@ private fun HomeErrorBanner(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Icon(Icons.Rounded.ErrorOutline, contentDescription = "Sync error", tint = Color(0xFFFCA5A5))
+            Icon(Icons.Rounded.ErrorOutline, contentDescription = null, tint = colors.error)
             Column(modifier = Modifier.weight(1f)) {
-                Text("Library sync needs attention", color = Color.White, fontWeight = FontWeight.Bold)
-                Text(message, color = Color.White.copy(alpha = 0.7f), style = MaterialTheme.typography.bodySmall)
+                Text(
+                    stringResource(R.string.home_error_title),
+                    color = colors.onErrorContainer,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    message,
+                    color = colors.onErrorContainer,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.semantics {
+                        liveRegion = LiveRegionMode.Polite
+                        error(message)
+                    }
+                )
+                if (!technicalDetails.isNullOrBlank()) {
+                    val detailsStateDescription = stringResource(
+                        if (showingTechnicalDetails) R.string.recovery_details_expanded
+                        else R.string.recovery_details_collapsed
+                    )
+                    TextButton(
+                        onClick = { showingTechnicalDetails = !showingTechnicalDetails },
+                        contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .testTag("home_error_details_toggle")
+                            .semantics { stateDescription = detailsStateDescription }
+                    ) {
+                        Text(stringResource(if (showingTechnicalDetails) R.string.recovery_hide_details else R.string.recovery_show_details))
+                    }
+                    if (showingTechnicalDetails) {
+                        Text(
+                            technicalDetails,
+                            color = colors.onErrorContainer,
+                            style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier.testTag("home_error_technical_details")
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        onClick = onRetry,
+                        enabled = !isRetrying,
+                        modifier = Modifier.heightIn(min = 48.dp).testTag("home_retry_button")
+                    ) {
+                        Text(stringResource(if (isRetrying) R.string.home_retrying else R.string.home_retry))
+                    }
+                    TextButton(
+                        onClick = onNavigateToSettings,
+                        modifier = Modifier.heightIn(min = 48.dp).testTag("home_settings_button")
+                    ) { Text(stringResource(R.string.home_open_settings)) }
+                }
             }
-            TextButton(onClick = onNavigateToSettings) { Text("Settings") }
         }
     }
 }
 
 @Composable
-private fun StationDetailsDialog(
+internal fun HomeRecentlyAddedLoading() {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        CircularProgressIndicator(
+            modifier = Modifier.size(18.dp),
+            strokeWidth = 2.dp,
+            color = MaterialTheme.colorScheme.primary
+        )
+        Text(
+            text = stringResource(R.string.home_loading_recently_added),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            style = MaterialTheme.typography.bodySmall
+        )
+    }
+}
+
+@Composable
+internal fun HomeRecoveryBanners(
+    homeFeedFailure: FailurePresentation?,
+    actionErrorMessage: String?,
+    onRetryHomeFeed: () -> Unit,
+    onNavigateToSettings: () -> Unit,
+    onDismissActionError: () -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        homeFeedFailure?.let { failure ->
+            HomeErrorBanner(
+                message = failure.message,
+                technicalDetails = failure.technicalDetails,
+                onNavigateToSettings = onNavigateToSettings,
+                onRetry = onRetryHomeFeed
+            )
+        }
+
+        actionErrorMessage
+            ?.takeIf { it != homeFeedFailure?.message }
+            ?.let { message ->
+                HomeActionErrorBanner(
+                    message = message,
+                    onDismiss = onDismissActionError
+                )
+            }
+    }
+}
+
+@Composable
+internal fun HomeActionErrorBanner(
+    message: String,
+    onDismiss: () -> Unit
+) {
+    val colors = MaterialTheme.colorScheme
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        colors = CardDefaults.cardColors(containerColor = colors.errorContainer),
+        border = androidx.compose.foundation.BorderStroke(1.dp, colors.error.copy(alpha = 0.35f)),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Icon(Icons.Rounded.ErrorOutline, contentDescription = null, tint = colors.error)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    stringResource(R.string.home_action_error_title),
+                    color = colors.onErrorContainer,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    message,
+                    color = colors.onErrorContainer,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.semantics {
+                        liveRegion = LiveRegionMode.Polite
+                        error(message)
+                    }
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        onClick = onDismiss,
+                        modifier = Modifier.heightIn(min = 48.dp).testTag("home_action_error_dismiss_button")
+                    ) {
+                        Text(stringResource(R.string.home_dismiss_error))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun StationDetailsDialog(
     station: RecommendedStation,
     viewModel: MusicViewModel,
     onDismiss: () -> Unit,
     onPlay: (RadioRequest) -> Unit
 ) {
+    var stationRecipeSaved by remember(station.id) { mutableStateOf(false) }
     val cachedTracks by produceState<List<CachedTrack>?>(null, station.id) {
         value = runCatching { viewModel.repository.getCachedTracksList() }.getOrDefault(emptyList())
     }
+    val recentHistory by viewModel.recentlyPlayed.collectAsStateWithLifecycle()
     val cachedTrackList = cachedTracks.orEmpty()
     var trackCount by remember { mutableFloatStateOf(40f) }
     var discovery by remember { mutableStateOf(DiscoveryLevel.BALANCED) }
     var cooldown by remember { mutableFloatStateOf(7f) }
-    var selectedGenre by remember(station.id) { mutableStateOf<String?>(null) }
+    var selectedFacet by remember(station.id) { mutableStateOf<String?>(null) }
     var selectedDecade by remember(station.id) { mutableStateOf<Int?>(null) }
     var selectedCollection by remember(station.id) { mutableStateOf<String?>(null) }
     var selectedArtist by remember(station.id) { mutableStateOf<String?>(null) }
-    val genres = remember(cachedTracks) {
-        val extracted = cachedTrackList.flatMap { it.genres.split('|') }.map { it.trim() }.filter { it.isNotEmpty() }
-        val defaults = listOf("Rock", "Pop", "Hip-Hop", "Electronic", "Jazz", "Classical", "Ambient", "Indie", "R&B", "Metal", "Soundtrack", "Folk", "Alternative", "Dance")
-        (extracted + defaults).distinct().sorted().take(12)
+    val facets = remember(cachedTracks, station.type) {
+        stationRadioFacetChoices(station.type, cachedTrackList)
     }
     val decades = remember(cachedTracks) {
         val extracted = cachedTrackList.mapNotNull { it.year }.map { (it / 10) * 10 }
@@ -640,8 +730,8 @@ private fun StationDetailsDialog(
     val artists = remember(cachedTracks) {
         cachedTrackList.map { it.artist }.filter { it.isNotBlank() }.distinct().sorted().take(12)
     }
-    LaunchedEffect(genres, decades, collections, artists, station.type) {
-        if (selectedGenre == null) selectedGenre = genres.firstOrNull()
+    LaunchedEffect(facets, decades, collections, artists, station.type) {
+        if (facets.none { it == selectedFacet }) selectedFacet = facets.firstOrNull()
         if (selectedDecade == null) selectedDecade = decades.firstOrNull()
         if (selectedCollection == null) selectedCollection = collections.firstOrNull()
         if (selectedArtist == null) selectedArtist = artists.firstOrNull()
@@ -649,36 +739,42 @@ private fun StationDetailsDialog(
     val previewRequest = remember(
         station.type,
         selectedArtist,
-        selectedGenre,
+        selectedFacet,
         selectedCollection,
         selectedDecade,
         trackCount,
-        discovery
+        discovery,
+        cooldown
     ) {
-        RadioRequest(
+        stationRadioRequest(
             type = station.type,
             seedArtist = selectedArtist,
-            genre = selectedGenre,
+            selectedFacet = selectedFacet,
             collection = selectedCollection,
             decadeStart = selectedDecade,
             trackCount = trackCount.toInt(),
             discoveryLevel = discovery,
-            recentCooldownDays = 0
+            recentCooldownDays = cooldown.toInt()
         )
     }
-    val matchingTrackCount = remember(cachedTrackList, previewRequest) {
-        if (cachedTracks == null) null else RadioService().generate(previewRequest, cachedTrackList).size
+    val matchingTrackCount = remember(cachedTrackList, previewRequest, recentHistory) {
+        if (cachedTracks == null) null else RadioService().generate(previewRequest, cachedTrackList, recentHistory).size
     }
     val selectionExplanation = when {
-        selectedArtist != null && station.type == RadioType.ARTIST_RADIO -> "Based on artist: $selectedArtist"
-        selectedGenre != null && station.type in setOf(RadioType.GENRE_RADIO, RadioType.MOOD_RADIO, RadioType.STYLE_RADIO) -> "Based on library genre: $selectedGenre"
-        selectedCollection != null && station.type == RadioType.COLLECTION_RADIO -> "Based on library collection: $selectedCollection"
-        selectedDecade != null && station.type in setOf(RadioType.DECADE_RADIO, RadioType.TIME_TRAVEL) -> "Based on release decade: $selectedDecade–${selectedDecade!! + 9}"
-        station.type == RadioType.RECENTLY_ADDED_RADIO -> "Ranked by library added time"
-        station.type == RadioType.DEEP_CUTS -> "Ranked by lowest play count"
-        station.type == RadioType.FORGOTTEN_FAVORITES -> "Played history, excluding recent listens"
-        else -> "Selected from your indexed library"
+        selectedArtist != null && station.type == RadioType.ARTIST_RADIO -> stringResource(R.string.station_selection_artist, selectedArtist!!)
+        selectedFacet != null && station.type == RadioType.GENRE_RADIO -> stringResource(R.string.station_selection_genre, selectedFacet!!)
+        selectedFacet != null && station.type == RadioType.MOOD_RADIO -> stringResource(R.string.station_selection_mood, selectedFacet!!)
+        selectedFacet != null && station.type == RadioType.STYLE_RADIO -> stringResource(R.string.station_selection_style, selectedFacet!!)
+        selectedCollection != null && station.type == RadioType.COLLECTION_RADIO -> stringResource(R.string.station_selection_collection, selectedCollection!!)
+        selectedDecade != null && station.type in setOf(RadioType.DECADE_RADIO, RadioType.TIME_TRAVEL) -> stringResource(R.string.station_selection_decade, selectedDecade!!, selectedDecade!! + 9)
+        station.type == RadioType.RECENTLY_ADDED_RADIO -> stringResource(R.string.station_selection_recently_added)
+        station.type == RadioType.DEEP_CUTS -> stringResource(R.string.station_selection_deep_cuts)
+        station.type == RadioType.FORGOTTEN_FAVORITES -> stringResource(R.string.station_selection_forgotten_favorites)
+        else -> stringResource(R.string.station_selected_from_library)
     }
+    val trackCountLabel = stringResource(R.string.station_track_count_label)
+    val repeatFilterLabel = stringResource(R.string.station_repeat_filter_label)
+    val colors = MaterialTheme.colorScheme
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(station.title) },
@@ -687,38 +783,68 @@ private fun StationDetailsDialog(
                 Text(station.subtitle, style = MaterialTheme.typography.bodySmall)
                 Text(
                     text = when (matchingTrackCount) {
-                        null -> "Checking cached library tracks…"
-                        0 -> "No cached library tracks match these selections. Sync your library to refresh metadata."
-                        else -> "$matchingTrackCount matching cached library tracks"
+                        null -> stringResource(stationLibrarySummaryString(StationLibrarySummary.Checking))
+                        0 -> stringResource(stationLibrarySummaryString(StationLibrarySummary.NoMatches))
+                        else -> stringResource(
+                            stationLibrarySummaryString(StationLibrarySummary.Matches(matchingTrackCount)),
+                            matchingTrackCount
+                        )
                     },
-                    color = if (matchingTrackCount == 0) Color(0xFFFBBF24) else Color.White.copy(alpha = 0.65f),
+                    color = if (matchingTrackCount == 0) colors.error else colors.onSurfaceVariant,
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
                     text = selectionExplanation,
-                    color = Color.White.copy(alpha = 0.48f),
+                    color = colors.onSurfaceVariant,
                     style = MaterialTheme.typography.bodySmall
                 )
-                Text("Tracks: ${trackCount.toInt()}")
-                Slider(value = trackCount, onValueChange = { trackCount = it }, valueRange = 10f..100f, steps = 8)
-                Text("Discovery")
+                Text(stringResource(R.string.station_track_count, trackCount.toInt()))
+                Slider(
+                    value = trackCount,
+                    onValueChange = { trackCount = it },
+                    valueRange = 10f..100f,
+                    steps = 8,
+                    modifier = Modifier.semantics {
+                        contentDescription = trackCountLabel
+                    }
+                )
+                Text(stringResource(R.string.station_discovery_label))
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     DiscoveryLevel.values().forEach { level ->
-                        FilterChip(selected = discovery == level, onClick = { discovery = level }, label = { Text(level.name.replace('_', ' '), fontSize = 11.sp) })
+                        FilterChip(selected = discovery == level, onClick = { discovery = level }, label = { Text(stationDiscoveryLabel(level), fontSize = 11.sp) })
                     }
                 }
-                Text("Recent-play cooldown: ${cooldown.toInt()} days")
-                Slider(value = cooldown, onValueChange = { cooldown = it }, valueRange = 0f..30f, steps = 5)
+                Text(
+                    if (cooldown.toInt() == 0) stringResource(R.string.station_repeat_filter_none)
+                    else pluralStringResource(R.plurals.station_repeat_filter_days, cooldown.toInt(), cooldown.toInt())
+                )
+                Slider(
+                    value = cooldown,
+                    onValueChange = { cooldown = it },
+                    valueRange = 0f..30f,
+                    steps = 5,
+                    modifier = Modifier.semantics {
+                        contentDescription = repeatFilterLabel
+                    }
+                )
                 if (station.type == RadioType.GENRE_RADIO || station.type == RadioType.MOOD_RADIO || station.type == RadioType.STYLE_RADIO) {
-                    Text("Genre")
-                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        items(genres) { genre ->
-                            FilterChip(selected = selectedGenre == genre, onClick = { selectedGenre = genre }, label = { Text(genre, fontSize = 11.sp) })
+                    Text(stringResource(stationRadioFacetLabel(station.type)))
+                    if (facets.isEmpty()) {
+                        Text(
+                            text = stringResource(stationRadioEmptyChoicesString(station.type)),
+                            color = colors.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    } else {
+                        LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            items(facets) { facet ->
+                                FilterChip(selected = selectedFacet == facet, onClick = { selectedFacet = facet }, label = { Text(facet, fontSize = 11.sp) })
+                            }
                         }
                     }
                 }
                 if (station.type == RadioType.DECADE_RADIO || station.type == RadioType.TIME_TRAVEL) {
-                    Text("Decade")
+                    Text(stringResource(R.string.station_decade_label))
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(decades) { decade ->
                             FilterChip(selected = selectedDecade == decade, onClick = { selectedDecade = decade }, label = { Text("$decade", fontSize = 11.sp) })
@@ -726,7 +852,7 @@ private fun StationDetailsDialog(
                     }
                 }
                 if (station.type == RadioType.COLLECTION_RADIO) {
-                    Text("Collection")
+                    Text(stringResource(R.string.station_collection_label))
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(collections) { collection ->
                             FilterChip(selected = selectedCollection == collection, onClick = { selectedCollection = collection }, label = { Text(collection, fontSize = 11.sp) })
@@ -734,10 +860,11 @@ private fun StationDetailsDialog(
                     }
                 }
                 if (station.type == RadioType.ARTIST_RADIO) {
-                    Text("Artist")
+                    Text(stringResource(R.string.station_artist_label))
                     Text(
-                        text = selectedArtist?.let { "Selected: $it" } ?: if (cachedTracks == null) "Loading cached artists…" else "No cached artists available",
-                        color = Color.White.copy(alpha = 0.65f),
+                        text = selectedArtist?.let { stringResource(R.string.station_selected_artist, it) }
+                            ?: stringResource(stationArtistStatusString(isLoading = cachedTracks == null)),
+                        color = colors.onSurfaceVariant,
                         style = MaterialTheme.typography.bodySmall
                     )
                     LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -749,17 +876,41 @@ private fun StationDetailsDialog(
             }
         },
         confirmButton = {
-            Button(onClick = {
-                onPlay(RadioRequest(station.type, seedArtist = selectedArtist, genre = selectedGenre, collection = selectedCollection, decadeStart = selectedDecade, trackCount = trackCount.toInt(), discoveryLevel = discovery, recentCooldownDays = cooldown.toInt()))
-            }, enabled = when (station.type) {
+            Button(onClick = { onPlay(previewRequest) }, enabled = when (station.type) {
                 RadioType.ARTIST_RADIO -> selectedArtist != null
-                RadioType.MOOD_RADIO, RadioType.STYLE_RADIO, RadioType.GENRE_RADIO -> selectedGenre != null
+                RadioType.MOOD_RADIO, RadioType.STYLE_RADIO, RadioType.GENRE_RADIO -> selectedFacet != null
                 RadioType.DECADE_RADIO -> selectedDecade != null
                 RadioType.COLLECTION_RADIO -> selectedCollection != null
                 else -> true
-            }) { Text("Play station") }
+            }) { Text(stringResource(R.string.station_play_action)) }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
+        dismissButton = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = onDismiss) { Text(stringResource(R.string.station_cancel_action)) }
+                TextButton(
+                    onClick = {
+                        val recipeName = listOfNotNull(
+                            previewRequest.seedArtist,
+                            previewRequest.seedAlbum,
+                            previewRequest.genre,
+                            previewRequest.mood,
+                            previewRequest.style,
+                            previewRequest.collection
+                        ).firstOrNull()?.let { "$it Radio" } ?: station.title
+                        viewModel.saveStationRecipe(SavedStationRecipe.fromRequest(recipeName, previewRequest))
+                        stationRecipeSaved = true
+                    },
+                    modifier = Modifier.testTag("station_save_recipe_details")
+                ) {
+                    Text(
+                        stringResource(
+                            if (stationRecipeSaved) R.string.discover_station_recipe_saved
+                            else R.string.discover_save_station_recipe
+                        )
+                    )
+                }
+            }
+        }
     )
 }
 
@@ -771,9 +922,15 @@ private fun StationDetailsDialog(
 fun HomeHeader(
     libraryName: String,
     isConfigured: Boolean,
+    hasConnectionError: Boolean,
+    hasCachedMusic: Boolean = false,
     source: HomeFeedSource,
-    onNavigateToSettings: () -> Unit
+    onNavigateToSettings: () -> Unit,
+    companionConfigured: Boolean = false,
+    connectionStatus: CompanionConnectionStatus = CompanionConnectionStatus.CHECKING,
+    showPairingGuidance: Boolean = true
 ) {
+    val colorScheme = MaterialTheme.colorScheme
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -788,81 +945,105 @@ fun HomeHeader(
             ) {
                 Icon(
                     imageVector = Icons.Rounded.Dns,
-                    contentDescription = "Server Connection",
-                    tint = if (isConfigured) Color(0xFF10B981) else Color(0xFFEF4444),
+                    contentDescription = null,
+                    tint = when {
+                        companionConfigured && CompanionConnectionPresentation.isHealthy(connectionStatus) -> Color(0xFF047857)
+                        companionConfigured && connectionStatus == CompanionConnectionStatus.CHECKING -> colorScheme.primary
+                        companionConfigured && connectionStatus == CompanionConnectionStatus.OFFLINE_LIBRARY_AVAILABLE -> Color(0xFF92400E)
+                        !companionConfigured && isConfigured && !hasConnectionError -> Color(0xFF047857)
+                        else -> colorScheme.error
+                    },
                     modifier = Modifier.size(16.dp)
                 )
                 Text(
                     text = when {
-                        source == HomeFeedSource.SPOTCORE -> "SPOTCORE CONNECTED"
-                        isConfigured -> "MUSIC BACKEND CONNECTED"
-                        else -> "OFFLINE MODE"
+                        companionConfigured -> stringResource(connectionStatusLabelResource(connectionStatus))
+                        hasConnectionError -> if (companionConfigured) stringResource(R.string.connection_unavailable) else stringResource(R.string.connection_unavailable_generic)
+                        source == HomeFeedSource.SPOTCORE -> stringResource(
+                            connectionStatusLabelResource(CompanionConnectionStatus.CONNECTED)
+                        )
+                        isConfigured -> stringResource(R.string.connection_library_ready)
+                        hasCachedMusic -> stringResource(R.string.connection_offline_mode)
+                        else -> stringResource(R.string.connection_connect_spotcore)
                     },
                     style = MaterialTheme.typography.bodySmall.copy(
-                        color = Color.White.copy(alpha = 0.5f),
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 1.sp
-                    )
+                        color = colorScheme.onSurfaceVariant,
+                        fontWeight = FontWeight.SemiBold,
+                        letterSpacing = 0.2.sp
+                    ),
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis
                 )
             }
             Text(
-                text = if (libraryName.isNotEmpty()) libraryName else "Music Library",
+                text = if (libraryName.isNotEmpty()) libraryName else stringResource(R.string.home_default_library_name),
                 style = MaterialTheme.typography.headlineMedium.copy(
                     fontWeight = FontWeight.Black,
-                    color = Color.White,
+                    color = colorScheme.onSurface,
                     letterSpacing = (-0.5).sp
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
-            Text(
-                text = when {
-                    source == HomeFeedSource.SPOTCORE -> "CLAP and taxonomy-powered discovery"
-                    isConfigured -> "Local-first • backend metadata"
-                    else -> "Cached music • Offline capable"
-                },
-                style = MaterialTheme.typography.labelSmall.copy(
-                    color = Color.White.copy(alpha = 0.45f),
-                    letterSpacing = 0.2.sp
-                ),
-                modifier = Modifier.padding(top = 2.dp)
-            )
+            if (showPairingGuidance) {
+                Text(
+                    text = when {
+                        companionConfigured && connectionStatus == CompanionConnectionStatus.OFFLINE_LIBRARY_AVAILABLE -> stringResource(R.string.connection_offline_body)
+                        companionConfigured && connectionStatus == CompanionConnectionStatus.TEMPORARILY_UNAVAILABLE -> stringResource(R.string.connection_unavailable_body)
+                        companionConfigured && connectionStatus == CompanionConnectionStatus.CHECKING -> stringResource(R.string.connection_checking_body)
+                        hasConnectionError && hasCachedMusic -> stringResource(R.string.connection_cached_refresh)
+                        hasConnectionError -> stringResource(R.string.connection_unavailable_body)
+                        source == HomeFeedSource.SPOTCORE -> stringResource(R.string.connection_connected_body)
+                        isConfigured -> stringResource(R.string.connection_local_library_body)
+                        hasCachedMusic -> stringResource(R.string.connection_cached_body)
+                        else -> stringResource(R.string.home_pairing_body)
+                    },
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        color = colorScheme.onSurfaceVariant,
+                        letterSpacing = 0.2.sp
+                    ),
+                    modifier = Modifier.padding(top = 2.dp)
+                )
+            }
+            if (
+                companionConfigured &&
+                !hasConnectionError &&
+                (connectionStatus == CompanionConnectionStatus.TEMPORARILY_UNAVAILABLE ||
+                    connectionStatus == CompanionConnectionStatus.OFFLINE_LIBRARY_AVAILABLE)
+            ) {
+                TextButton(
+                    onClick = onNavigateToSettings,
+                    contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
+                    modifier = Modifier.testTag("home_reconnect_settings")
+                ) {
+                    Text(stringResource(R.string.home_connection_settings))
+                }
+            }
         }
 
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // Cast/Output visual icon
-            IconButton(
-                onClick = { /* Casting support is not implemented yet. */ },
-                enabled = false,
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.04f))
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.Cast,
-                    contentDescription = "Casting unavailable",
-                    tint = Color.White.copy(alpha = 0.35f),
-                    modifier = Modifier.size(18.dp)
-                )
-            }
-
             IconButton(
                 onClick = onNavigateToSettings,
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.04f))
+                modifier = Modifier.size(48.dp).testTag("home_settings_button")
             ) {
-                Icon(
-                    imageVector = Icons.Rounded.Settings,
-                    contentDescription = "Settings",
-                    tint = Color.White.copy(alpha = 0.8f),
-                    modifier = Modifier.size(18.dp)
-                )
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(colorScheme.surfaceVariant),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Settings,
+                        contentDescription = stringResource(R.string.nav_settings),
+                        tint = colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
             }
         }
     }
@@ -878,6 +1059,7 @@ fun HomeSpotlight(
     onOpen: () -> Unit
 ) {
     val context = LocalContext.current
+    val fontScale = LocalDensity.current.fontScale.coerceAtLeast(1f)
     val cover = mix.tracks.firstOrNull()?.thumb.orEmpty()
     val imageRequest = remember(cover, baseUrl, token) {
         cover.takeIf(String::isNotBlank)?.let {
@@ -887,13 +1069,16 @@ fun HomeSpotlight(
     val colors = mix.colors.map(::Color).ifEmpty {
         listOf(Color(0xFF312E81), Color(0xFF0E7490))
     }
+    val openMixLabel = stringResource(R.string.home_open_spotlight_accessibility, mix.title)
+    val playMixLabel = stringResource(R.string.home_play_mix_accessibility, mix.title)
 
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp)
-            .height(190.dp)
-            .clickable(onClick = onOpen),
+            .height(190.dp * fontScale)
+            .clickable(role = Role.Button, onClick = onOpen)
+            .semantics { contentDescription = openMixLabel },
         shape = RoundedCornerShape(28.dp),
         colors = CardDefaults.cardColors(containerColor = Color.Transparent),
         border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.12f))
@@ -916,9 +1101,9 @@ fun HomeSpotlight(
                 ) {
                     Text(
                         text = if (source == HomeFeedSource.SPOTCORE) {
-                            "SPOTCORE INTELLIGENCE"
+                            stringResource(R.string.home_spotlight_from_library)
                         } else {
-                            "MADE FOR YOU"
+                            stringResource(R.string.home_spotlight_made_for_you)
                         },
                         color = Color.White.copy(alpha = 0.78f),
                         fontSize = 10.sp,
@@ -944,7 +1129,9 @@ fun HomeSpotlight(
                     )
                     Button(
                         onClick = onPlay,
-                        modifier = Modifier.padding(top = 12.dp),
+                        modifier = Modifier
+                            .padding(top = 12.dp)
+                            .semantics { contentDescription = playMixLabel },
                         colors = ButtonDefaults.buttonColors(
                             containerColor = Color.White,
                             contentColor = Color(0xFF111827)
@@ -952,7 +1139,7 @@ fun HomeSpotlight(
                     ) {
                         Icon(Icons.Rounded.PlayArrow, contentDescription = null)
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Play", fontWeight = FontWeight.Bold)
+                        Text(stringResource(R.string.common_action_play), fontWeight = FontWeight.Bold)
                     }
                 }
 
@@ -966,7 +1153,7 @@ fun HomeSpotlight(
                     if (imageRequest != null) {
                         AsyncImage(
                             model = imageRequest,
-                            contentDescription = mix.title,
+                            contentDescription = null,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
                         )
@@ -979,56 +1166,6 @@ fun HomeSpotlight(
                         )
                     }
                 }
-            }
-        }
-    }
-}
-
-@Composable
-fun UnconfiguredBanner(onNavigateToSettings: () -> Unit) {
-    Card(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF7F1D1D).copy(alpha = 0.3f)),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFEF4444).copy(alpha = 0.2f))
-    ) {
-        Column(
-            modifier = Modifier.padding(18.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Rounded.WifiOff,
-                    contentDescription = "Offline Mode",
-                    tint = Color(0xFFFCA5A5)
-                )
-                Text(
-                    text = "Your music library is offline",
-                    style = MaterialTheme.typography.titleMedium.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
-                )
-            }
-            Text(
-                text = "Connect a music backend in Settings, or index your library to browse cached music while offline.",
-                style = MaterialTheme.typography.bodyMedium.copy(
-                    color = Color.White.copy(alpha = 0.7f),
-                    lineHeight = 20.sp
-                )
-            )
-            Button(
-                onClick = onNavigateToSettings,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444)),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.align(Alignment.End)
-            ) {
-                Text("Configure Connection", fontWeight = FontWeight.Bold)
             }
         }
     }
@@ -1051,27 +1188,28 @@ fun SectionHeader(
             text = title,
             style = MaterialTheme.typography.titleLarge.copy(
                 fontWeight = FontWeight.Black,
-                color = Color.White,
+                color = MaterialTheme.colorScheme.onSurface,
                 fontSize = 20.sp,
                 letterSpacing = (-0.2).sp
             )
         )
         if (onSeeAllClick != null) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.clickable { onSeeAllClick() }
+            TextButton(
+                onClick = onSeeAllClick,
+                contentPadding = PaddingValues(0.dp),
+                modifier = Modifier.testTag("home_see_all_button")
             ) {
                 Text(
-                    text = "See all",
+                    text = stringResource(R.string.home_action_see_all),
                     style = MaterialTheme.typography.bodyMedium.copy(
-                        color = Color(0xFF818CF8),
+                        color = MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.Bold
                     )
                 )
                 Icon(
                     imageVector = Icons.Rounded.ChevronRight,
-                    contentDescription = "See all",
-                    tint = Color(0xFF818CF8),
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.size(16.dp)
                 )
             }
@@ -1091,12 +1229,12 @@ fun RecentPlaysSection(
     onMoreClick: (HomeRecentPlay) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        SectionHeader(title = "Recent Plays")
+        SectionHeader(title = stringResource(R.string.home_section_recent_plays))
         LazyRow(
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            items(recentPlays) { play ->
+            itemsIndexed(recentPlays, key = { index, play -> "rp_${index}_${play.id}" }) { _, play ->
                 RecentPlayCard(
                     play = play,
                     baseUrl = baseUrl,
@@ -1124,12 +1262,14 @@ fun RecentPlayCard(
         modifier = Modifier
             .width(140.dp)
             .homeTileGesture(
+                onClickLabel = stringResource(R.string.home_tile_play_accessibility, play.title),
+                onLongClickLabel = stringResource(R.string.details_more_options_accessibility, play.title),
                 onClick = onPlayClick,
                 onLongClick = onMoreClick
             ),
         shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.03f)),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.05f))
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
     ) {
         Column(modifier = Modifier.padding(10.dp)) {
             Box(
@@ -1145,7 +1285,7 @@ fun RecentPlayCard(
                     if (imageUrl != null) {
                         AsyncImage(
                             model = authenticatedArtworkRequest(context, imageUrl, token),
-                            contentDescription = play.title,
+                            contentDescription = null,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
                         )
@@ -1191,15 +1331,15 @@ fun RecentPlayCard(
                 text = play.title,
                 style = MaterialTheme.typography.bodyMedium.copy(
                     fontWeight = FontWeight.Bold,
-                    color = Color.White
+                    color = MaterialTheme.colorScheme.onSurface
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
             Text(
-                text = play.artist,
+                text = localizedArtistPresentation(play.artist),
                 style = MaterialTheme.typography.bodySmall.copy(
-                    color = Color.White.copy(alpha = 0.5f)
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -1220,12 +1360,12 @@ fun RecentlyAddedSection(
     onMoreClick: (PlexMetadata) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        SectionHeader(title = "Recently Added in Music")
+        SectionHeader(title = stringResource(R.string.home_section_recently_added))
         LazyRow(
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            items(albums) { album ->
+            items(albums, key = { it.ratingKey }) { album ->
                 AlbumCard(
                     album = album,
                     baseUrl = baseUrl,
@@ -1255,6 +1395,8 @@ fun AlbumCard(
         modifier = Modifier
             .width(130.dp)
             .homeTileGesture(
+                onClickLabel = stringResource(R.string.home_tile_open_album_accessibility, album.title),
+                onLongClickLabel = stringResource(R.string.details_more_options_accessibility, album.title),
                 onClick = onClick,
                 onLongClick = onMoreClick
             )
@@ -1268,12 +1410,12 @@ fun AlbumCard(
                 modifier = Modifier.fillMaxSize(),
                 shape = RoundedCornerShape(16.dp),
                 elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.05f))
+                border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
             ) {
                 if (imageUrl != null) {
                     AsyncImage(
                         model = authenticatedArtworkRequest(context, imageUrl, token),
-                        contentDescription = album.title,
+                        contentDescription = null,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
                     )
@@ -1326,7 +1468,7 @@ fun AlbumCard(
                 ) {
                     Icon(
                         Icons.Rounded.CloudDownload,
-                        contentDescription = "Downloaded",
+                        contentDescription = stringResource(R.string.downloads_available_offline),
                         tint = Color.White,
                         modifier = Modifier.size(12.dp)
                     )
@@ -1338,15 +1480,15 @@ fun AlbumCard(
             text = album.title,
             style = MaterialTheme.typography.bodyMedium.copy(
                 fontWeight = FontWeight.Bold,
-                color = Color.White
+                color = MaterialTheme.colorScheme.onSurface
             ),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
         Text(
-            text = album.parentTitle ?: "Various Artists",
+            text = localizedArtistPresentation(album.parentTitle?.takeIf(String::isNotBlank) ?: "Various Artists"),
             style = MaterialTheme.typography.bodySmall.copy(
-                color = Color.White.copy(alpha = 0.5f)
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             ),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
@@ -1407,12 +1549,12 @@ fun DailyMixesSection(
     onMixClick: (DailyMix) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        SectionHeader(title = "Daily Mixes")
+        SectionHeader(title = stringResource(R.string.home_section_daily_mixes))
         LazyRow(
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            items(mixes) { mix ->
+            items(mixes, key = { it.id }) { mix ->
                 MixCard(mix = mix, baseUrl = baseUrl, token = token, onClick = { onMixClick(mix) })
             }
         }
@@ -1429,6 +1571,7 @@ fun MixCard(
     val gradientColors = mix.colors.map { Color(it) }
     val track = mix.tracks.firstOrNull()
     val context = LocalContext.current
+    val openMixLabel = stringResource(R.string.home_open_mix_accessibility, mix.title)
     val imageRequest = remember(track?.thumb, baseUrl, token) {
         if (track != null && track.thumb.isNotEmpty()) {
             authenticatedArtworkRequest(
@@ -1443,7 +1586,8 @@ fun MixCard(
         modifier = Modifier
             .width(160.dp)
             .height(240.dp)
-            .clickable { onClick() }
+            .clickable(role = Role.Button, onClick = onClick)
+            .semantics { contentDescription = openMixLabel }
             .testTag("daily_mix_card_${mix.id}"),
         shape = RoundedCornerShape(24.dp),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
@@ -1472,7 +1616,7 @@ fun MixCard(
                     if (imageRequest != null) {
                         AsyncImage(
                             model = imageRequest,
-                            contentDescription = mix.title,
+                            contentDescription = null,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
                         )
@@ -1502,7 +1646,7 @@ fun MixCard(
                                 .padding(horizontal = 6.dp, vertical = 2.dp)
                         ) {
                             Text(
-                                text = "MIX",
+                                text = stringResource(R.string.home_mix_badge),
                                 fontSize = 8.sp,
                                 fontWeight = FontWeight.Black,
                                 color = Color.White,
@@ -1512,7 +1656,7 @@ fun MixCard(
 
                         Icon(
                             imageVector = Icons.Rounded.PlayCircle,
-                            contentDescription = "Play Mix",
+                            contentDescription = null,
                             tint = Color.White,
                             modifier = Modifier.size(24.dp)
                         )
@@ -1529,7 +1673,7 @@ fun MixCard(
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = mix.description,
+                        text = stringResource(R.string.home_mix_based_on_reason, mix.reason),
                         style = MaterialTheme.typography.bodySmall.copy(
                             color = Color.White.copy(alpha = 0.7f),
                             fontWeight = FontWeight.Medium,
@@ -1556,12 +1700,12 @@ fun JumpBackInSection(
     onItemClick: (JumpBackInItem) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        SectionHeader(title = "Jump Back In")
+        SectionHeader(title = stringResource(R.string.home_section_jump_back_in))
         LazyRow(
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            items(items) { jbi ->
+            items(items, key = { it.id }) { jbi ->
                 JumpBackInCard(jbi = jbi, baseUrl = baseUrl, token = token, onClick = { onItemClick(jbi) })
             }
         }
@@ -1582,7 +1726,7 @@ fun JumpBackInCard(
     Column(
         modifier = Modifier
             .width(110.dp)
-            .clickable { onClick() },
+            .clickable(role = Role.Button, onClick = onClick),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Box(
@@ -1647,7 +1791,7 @@ fun JumpBackInCard(
             text = jbi.title,
             style = MaterialTheme.typography.bodyMedium.copy(
                 fontWeight = FontWeight.Bold,
-                color = Color.White,
+                color = MaterialTheme.colorScheme.onSurface,
                 fontSize = 12.sp
             ),
             maxLines = 1,
@@ -1657,7 +1801,7 @@ fun JumpBackInCard(
         Text(
             text = jbi.subtitle,
             style = MaterialTheme.typography.bodySmall.copy(
-                color = Color.White.copy(alpha = 0.5f),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 10.sp
             ),
             maxLines = 1,
@@ -1676,16 +1820,16 @@ fun RecommendedStationsSection(
     onStationClick: (RecommendedStation) -> Unit
 ) {
     // resolve the 9 main options
-    val libraryRadio = stations.firstOrNull { it.type == RadioType.LIBRARY_RADIO } ?: RecommendedStation("st_lib", "Library Radio", "Continuous mix of your self-hosted collection", RadioType.LIBRARY_RADIO, listOf(0xFF1E3A8A, 0xFF0D9488))
-    val artistMixBuilder = stations.firstOrNull { it.type == RadioType.ARTIST_RADIO } ?: RecommendedStation("st_art", "Artist Mix Builder", "Build a station around selected artists", RadioType.ARTIST_RADIO, listOf(0xFF065F46, 0xFF10B981))
+    val libraryRadio = stations.firstOrNull { it.type == RadioType.LIBRARY_RADIO } ?: RecommendedStation("st_lib", "Library Radio", stringResource(R.string.station_description_library), RadioType.LIBRARY_RADIO, listOf(0xFF1E3A8A, 0xFF0D9488))
+    val artistMixBuilder = stations.firstOrNull { it.type == RadioType.ARTIST_RADIO } ?: RecommendedStation("st_art", "Artist Mix Builder", stringResource(R.string.station_description_artist), RadioType.ARTIST_RADIO, listOf(0xFF065F46, 0xFF10B981))
     val albumMixBuilder = RecommendedStation("st_alb", "Album Mix Builder", "Build a station around selected albums", RadioType.ALBUM_RADIO, listOf(0xFF4C0519, 0xFFF43F5E))
-    val deepCuts = stations.firstOrNull { it.type == RadioType.DEEP_CUTS } ?: RecommendedStation("st_deep", "Deep Cuts Radio", "Unearth rare, lesser-played library files", RadioType.DEEP_CUTS, listOf(0xFF130026, 0xFF8B5CF6))
-    val timeTravel = stations.firstOrNull { it.type == RadioType.TIME_TRAVEL } ?: RecommendedStation("st_time", "Time Travel Radio", "Songs from a selected release decade", RadioType.TIME_TRAVEL, listOf(0xFF451A03, 0xFFD97706))
-    val randomAlbum = stations.firstOrNull { it.type == RadioType.RANDOM_ALBUM } ?: RecommendedStation("st_rand", "Random Album Radio", "Plays full albums entirely at random", RadioType.RANDOM_ALBUM, listOf(0xFF172554, 0xFF3B82F6))
-    val genreRadio = stations.firstOrNull { it.type == RadioType.GENRE_RADIO } ?: RecommendedStation("st_genre", "Genre Radio", "Play tracks matching your favorite genres", RadioType.GENRE_RADIO, listOf(0xFF0EA5E9, 0xFF2563EB))
-    val styleRadio = stations.firstOrNull { it.type == RadioType.STYLE_RADIO } ?: RecommendedStation("st_style", "Style Radio", "Play tracks with style tags", RadioType.STYLE_RADIO, listOf(0xFF3B0764, 0xFFEC4899))
-    val moodRadio = stations.firstOrNull { it.type == RadioType.MOOD_RADIO } ?: RecommendedStation("st_mood", "Mood Radio", "Filter library by mood/genre", RadioType.MOOD_RADIO, listOf(0xFF022C22, 0xFF059669))
-    val decadeRadio = stations.firstOrNull { it.type == RadioType.DECADE_RADIO } ?: RecommendedStation("st_decade", "Decade Radio", "Select a release decade", RadioType.DECADE_RADIO, listOf(0xFF431407, 0xFFF97316))
+    val deepCuts = stations.firstOrNull { it.type == RadioType.DEEP_CUTS } ?: RecommendedStation("st_deep", "Deep Cuts Radio", stringResource(R.string.station_description_deep_cuts), RadioType.DEEP_CUTS, listOf(0xFF130026, 0xFF8B5CF6))
+    val timeTravel = stations.firstOrNull { it.type == RadioType.TIME_TRAVEL } ?: RecommendedStation("st_time", "Time Travel Radio", stringResource(R.string.station_description_decade), RadioType.TIME_TRAVEL, listOf(0xFF451A03, 0xFFD97706))
+    val randomAlbum = stations.firstOrNull { it.type == RadioType.RANDOM_ALBUM } ?: RecommendedStation("st_rand", "Random Album Radio", stringResource(R.string.station_description_random_album), RadioType.RANDOM_ALBUM, listOf(0xFF172554, 0xFF3B82F6))
+    val genreRadio = stations.firstOrNull { it.type == RadioType.GENRE_RADIO } ?: RecommendedStation("st_genre", "Genre Radio", stringResource(R.string.station_description_genre), RadioType.GENRE_RADIO, listOf(0xFF0EA5E9, 0xFF2563EB))
+    val styleRadio = stations.firstOrNull { it.type == RadioType.STYLE_RADIO } ?: RecommendedStation("st_style", "Style Radio", stringResource(R.string.station_description_style), RadioType.STYLE_RADIO, listOf(0xFF3B0764, 0xFFEC4899))
+    val moodRadio = stations.firstOrNull { it.type == RadioType.MOOD_RADIO } ?: RecommendedStation("st_mood", "Mood Radio", stringResource(R.string.station_description_mood), RadioType.MOOD_RADIO, listOf(0xFF022C22, 0xFF059669))
+    val decadeRadio = stations.firstOrNull { it.type == RadioType.DECADE_RADIO } ?: RecommendedStation("st_decade", "Decade Radio", stringResource(R.string.station_description_decade), RadioType.DECADE_RADIO, listOf(0xFF431407, 0xFFF97316))
 
     val gridItems = listOf(
         artistMixBuilder, albumMixBuilder, libraryRadio,
@@ -1695,30 +1839,31 @@ fun RecommendedStationsSection(
     )
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.padding(horizontal = 16.dp)) {
-        // High-end Section Header matching Photo 1 exactly: STATIONS capitalized with a neat divider
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        // Updated Header matching reference: small caps, letter spacing, thin line
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text(
-                text = "STATIONS",
-                style = MaterialTheme.typography.titleMedium.copy(
-                    fontWeight = FontWeight.Black,
-                    letterSpacing = 2.sp,
-                    color = Color.White
+                text = stringResource(R.string.home_section_stations),
+                style = MaterialTheme.typography.labelMedium.copy(
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 4.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 12.sp
                 )
             )
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(1.dp)
-                    .background(Color.White.copy(alpha = 0.08f))
+                    .height(0.5.dp)
+                    .background(MaterialTheme.colorScheme.outlineVariant)
             )
         }
         
-        // Dynamic 3x3 layout using standard Rows & Columns for complete scroll safety
-        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            gridItems.chunked(3).forEach { rowItems ->
+        // Compact 2-column grid with horizontal tiles
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            gridItems.chunked(2).forEach { rowItems ->
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     rowItems.forEach { station ->
                         PremiumStationTile(
@@ -1727,6 +1872,7 @@ fun RecommendedStationsSection(
                             modifier = Modifier.weight(1f)
                         )
                     }
+                    if (rowItems.size == 1) Spacer(Modifier.weight(1f))
                 }
             }
         }
@@ -1739,86 +1885,87 @@ fun PremiumStationTile(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val gradientColors = station.gradientColors.map { Color(it) }
-    val titleLines = when (station.type) {
-        RadioType.ARTIST_RADIO -> listOf("Artist Mix", "Builder")
-        RadioType.ALBUM_RADIO -> listOf("Album Mix", "Builder")
-        RadioType.LIBRARY_RADIO -> listOf("Library", "Radio")
-        RadioType.DEEP_CUTS -> listOf("Deep Cuts", "Radio")
-        RadioType.TIME_TRAVEL -> listOf("Time Travel", "Radio")
-        RadioType.RANDOM_ALBUM -> listOf("Random Album", "Radio")
-        RadioType.GENRE_RADIO -> listOf("Genre", "Radio")
-        RadioType.STYLE_RADIO -> listOf("Style", "Radio")
-        RadioType.MOOD_RADIO -> listOf("Mood", "Radio")
-        RadioType.DECADE_RADIO -> listOf("Decade", "Radio")
-        else -> listOf(station.title, "")
-    }
+    val accentColor = Color(station.gradientColors.firstOrNull() ?: 0xFF6366F1)
+
+    val tileCopy = stationTileCopy(station.type)
+    val title = tileCopy?.let { stringResource(it.title) } ?: station.title
+    val subtitle = stringResource(tileCopy?.subtitle ?: R.string.station_tile_generic_subtitle)
 
     val icon = when (station.type) {
         RadioType.ARTIST_RADIO -> Icons.Rounded.NorthEast
         RadioType.ALBUM_RADIO -> Icons.Rounded.PlaylistAdd
-        RadioType.LIBRARY_RADIO -> Icons.Rounded.Sensors
+        RadioType.LIBRARY_RADIO -> Icons.Rounded.Radio
         RadioType.DEEP_CUTS -> Icons.Rounded.Sensors
-        RadioType.TIME_TRAVEL -> Icons.Rounded.Sensors
-        RadioType.RANDOM_ALBUM -> Icons.Rounded.Sensors
-        RadioType.STYLE_RADIO -> Icons.Rounded.Sensors
-        RadioType.MOOD_RADIO -> Icons.Rounded.Sensors
-        RadioType.DECADE_RADIO -> Icons.Rounded.Sensors
-        else -> Icons.Rounded.Radio
+        RadioType.TIME_TRAVEL -> Icons.Rounded.History
+        RadioType.RANDOM_ALBUM -> Icons.Rounded.Shuffle
+        RadioType.STYLE_RADIO -> Icons.Rounded.Tune
+        RadioType.MOOD_RADIO -> Icons.Rounded.AutoAwesome
+        RadioType.DECADE_RADIO -> Icons.Rounded.CalendarToday
+        else -> Icons.Rounded.Sensors
     }
 
     Card(
         modifier = modifier
-            .height(115.dp)
-            .clickable { onClick() },
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.Transparent),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.08f))
+            .heightIn(min = 68.dp)
+            .clickable(role = Role.Button, onClick = onClick),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
     ) {
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Brush.verticalGradient(colors = gradientColors))
-                .padding(12.dp)
-        ) {
-            Column(
-                modifier = Modifier.fillMaxSize(),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Center
+        Box(modifier = Modifier.fillMaxWidth().heightIn(min = 68.dp)) {
+            // Left Accent Line
+            Box(
+                modifier = Modifier
+                    .width(3.dp)
+                    .fillMaxHeight(0.4f)
+                    .align(Alignment.CenterStart)
+                    .padding(start = 0.dp)
+                    .clip(RoundedCornerShape(topEnd = 2.dp, bottomEnd = 2.dp))
+                    .background(accentColor)
+            )
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                // Circular Icon
                 Box(
                     modifier = Modifier
-                        .size(40.dp)
+                        .size(36.dp)
                         .clip(CircleShape)
-                        .background(Color.White.copy(alpha = 0.15f)),
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
                         imageVector = icon,
                         contentDescription = null,
-                        tint = Color.White,
-                        modifier = Modifier.size(20.dp)
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
                     )
                 }
                 
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.width(12.dp))
                 
-                Text(
-                    text = titleLines[0],
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color.White,
-                    textAlign = TextAlign.Center,
-                    maxLines = 1
-                )
-                if (titleLines[1].isNotEmpty()) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
                     Text(
-                        text = titleLines[1],
-                        fontSize = 11.sp,
+                        text = title,
+                        fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
-                        color = Color.White.copy(alpha = 0.7f),
-                        textAlign = TextAlign.Center,
-                        maxLines = 1
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = subtitle,
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
@@ -1844,7 +1991,7 @@ fun MadeForYouSection(
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            items(madeForYou) { mfyItem ->
+            items(madeForYou, key = { it.id }) { mfyItem ->
                 LargeRecommendationCard(
                     mfyItem = mfyItem,
                     baseUrl = baseUrl,
@@ -1867,14 +2014,16 @@ fun LargeRecommendationCard(
 ) {
     val context = LocalContext.current
     val imageUrl = if (mfyItem.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, mfyItem.thumb) else null
+    val playActionLabel = stringResource(R.string.home_play_recommendation_accessibility, mfyItem.title)
+    val addQueueActionLabel = stringResource(R.string.home_add_recommendation_to_queue_accessibility, mfyItem.title)
 
     Card(
         modifier = Modifier
             .width(280.dp)
             .height(160.dp),
         shape = RoundedCornerShape(24.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.04f)),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.08f))
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
     ) {
         Row(modifier = Modifier.fillMaxSize()) {
             // Album art cover left
@@ -1924,7 +2073,7 @@ fun LargeRecommendationCard(
                         text = mfyItem.title,
                         style = MaterialTheme.typography.bodyMedium.copy(
                             fontWeight = FontWeight.Black,
-                            color = Color.White,
+                            color = MaterialTheme.colorScheme.onSurface,
                             fontSize = 15.sp
                         ),
                         maxLines = 1,
@@ -1933,7 +2082,7 @@ fun LargeRecommendationCard(
                     Text(
                         text = mfyItem.description,
                         style = MaterialTheme.typography.bodySmall.copy(
-                            color = Color.White.copy(alpha = 0.5f),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                             fontSize = 10.sp,
                             lineHeight = 13.sp
                         ),
@@ -1949,10 +2098,12 @@ fun LargeRecommendationCard(
                 ) {
                     Button(
                         onClick = onPlayClick,
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
+                        colors = ButtonDefaults.buttonColors(),
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                         shape = RoundedCornerShape(10.dp),
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier
+                            .weight(1f)
+                            .semantics { contentDescription = playActionLabel }
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.PlayArrow,
@@ -1960,22 +2111,29 @@ fun LargeRecommendationCard(
                             modifier = Modifier.size(14.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Play", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Text(stringResource(R.string.common_action_play), fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     }
 
                     IconButton(
                         onClick = onAddQueueClick,
                         modifier = Modifier
-                            .size(32.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color.White.copy(alpha = 0.06f))
+                            .size(48.dp)
+                            .semantics { contentDescription = addQueueActionLabel }
                     ) {
-                        Icon(
-                            imageVector = Icons.Rounded.Queue,
-                            contentDescription = "Add to queue",
-                            tint = Color.White,
-                            modifier = Modifier.size(16.dp)
-                        )
+                        Box(
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.Queue,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
                     }
                 }
             }
@@ -1997,13 +2155,13 @@ fun MoreFromSectionLayout(
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         SectionHeader(title = section.title)
         section.reason?.let { reason ->
-            Text(reason, color = Color.White.copy(alpha = 0.48f), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 16.dp))
+            Text(reason, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = 16.dp))
         }
         LazyRow(
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            items(section.tracks) { track ->
+            items(section.tracks, key = { it.ratingKey }) { track ->
                 TrackCard(
                     track = track,
                     baseUrl = baseUrl,
@@ -2032,6 +2190,8 @@ fun TrackCard(
         modifier = Modifier
             .width(120.dp)
             .homeTileGesture(
+                onClickLabel = stringResource(R.string.home_tile_play_accessibility, track.title),
+                onLongClickLabel = stringResource(R.string.details_more_options_accessibility, track.title),
                 onClick = onClick,
                 onLongClick = onMoreClick
             )
@@ -2044,12 +2204,12 @@ fun TrackCard(
             Card(
                 modifier = Modifier.fillMaxSize(),
                 shape = RoundedCornerShape(16.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.05f))
+                border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
             ) {
                 if (imageUrl != null) {
                     AsyncImage(
                         model = authenticatedArtworkRequest(context, imageUrl, token),
-                        contentDescription = track.title,
+                        contentDescription = null,
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
                     )
@@ -2080,15 +2240,15 @@ fun TrackCard(
             text = track.title,
             style = MaterialTheme.typography.bodyMedium.copy(
                 fontWeight = FontWeight.Bold,
-                color = Color.White
+                color = MaterialTheme.colorScheme.onSurface
             ),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
         Text(
-            text = track.artist,
+            text = localizedArtistPresentation(track.artist),
             style = MaterialTheme.typography.bodySmall.copy(
-                color = Color.White.copy(alpha = 0.5f)
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             ),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
@@ -2108,12 +2268,12 @@ fun MostPlayedSection(
     onMoreClick: (TrackItem) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        SectionHeader(title = "Most Played This Month")
+        SectionHeader(title = stringResource(R.string.home_section_most_played))
         LazyRow(
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            items(items) { item ->
+            items(items, key = { it.track.ratingKey }) { item ->
                 Box(modifier = Modifier.width(140.dp)) {
                     TrackCard(
                         track = item.track,
@@ -2132,7 +2292,7 @@ fun MostPlayedSection(
                             .padding(horizontal = 6.dp, vertical = 2.dp)
                     ) {
                         Text(
-                            text = "${item.playCount} plays",
+                            text = localizedPlayCountLabel(item.playCount),
                             fontSize = 8.sp,
                             fontWeight = FontWeight.Black,
                             color = Color.White
@@ -2156,20 +2316,21 @@ fun OnThisDaySection(
 ) {
     val context = LocalContext.current
     val imageUrl = if (onThisDay.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, onThisDay.thumb) else null
+    val colors = MaterialTheme.colorScheme
 
     Column(
         modifier = Modifier.padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        SectionHeader(title = "On This Day")
+        SectionHeader(title = stringResource(R.string.home_section_on_this_day))
 
         Card(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(180.dp),
             shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.Transparent),
-            border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.08f))
+            colors = CardDefaults.cardColors(containerColor = colors.surface),
+            border = androidx.compose.foundation.BorderStroke(1.dp, colors.outlineVariant)
         ) {
             Box(
                 modifier = Modifier
@@ -2247,15 +2408,15 @@ fun OnThisDaySection(
                                 text = onThisDay.title,
                                 style = MaterialTheme.typography.titleMedium.copy(
                                     fontWeight = FontWeight.Black,
-                                    color = Color.White
+                                    color = colors.onSurface
                                 ),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = onThisDay.artist,
+                                text = localizedArtistPresentation(onThisDay.artist),
                                 style = MaterialTheme.typography.bodyMedium.copy(
-                                    color = Color(0xFFFBBF24),
+                                    color = colors.onSurfaceVariant,
                                     fontWeight = FontWeight.Bold
                                 ),
                                 maxLines = 1,
@@ -2265,7 +2426,7 @@ fun OnThisDaySection(
                             Text(
                                 text = onThisDay.matchReason,
                                 style = MaterialTheme.typography.bodySmall.copy(
-                                    color = Color.White.copy(alpha = 0.6f),
+                                    color = colors.onSurfaceVariant,
                                     fontSize = 11.sp,
                                     lineHeight = 14.sp
                                 ),
@@ -2283,7 +2444,11 @@ fun OnThisDaySection(
                         ) {
                             Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Revisit Album", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                            Text(
+                                stringResource(R.string.home_on_this_day_play_album),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
                 }
@@ -2303,12 +2468,12 @@ fun NewReleasesSection(
     onReleaseClick: (NewReleaseItem) -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        SectionHeader(title = "New Releases For You")
+        SectionHeader(title = stringResource(R.string.home_section_new_releases))
         LazyRow(
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            items(releases) { release ->
+            items(releases, key = { it.title + it.artist }) { release ->
                 NewReleaseCard(release = release, baseUrl = baseUrl, token = token, onClick = { onReleaseClick(release) })
             }
         }
@@ -2329,7 +2494,7 @@ fun NewReleaseCard(
     Column(
         modifier = Modifier
             .width(130.dp)
-            .clickable { onClick() }
+            .clickable(role = Role.Button, onClick = onClick)
     ) {
         Box(
             modifier = Modifier
@@ -2373,11 +2538,11 @@ fun NewReleaseCard(
                 modifier = Modifier
                     .align(Alignment.BottomStart)
                     .padding(6.dp)
-                    .background(Color(0xFF10B981), RoundedCornerShape(6.dp))
+                    .background(Color(0xFF047857), RoundedCornerShape(6.dp))
                     .padding(horizontal = 6.dp, vertical = 2.dp)
             ) {
                 Text(
-                    text = "NEW",
+                    text = stringResource(R.string.home_new_badge),
                     fontSize = 8.sp,
                     fontWeight = FontWeight.Black,
                     color = Color.White,
@@ -2390,15 +2555,15 @@ fun NewReleaseCard(
             text = release.title,
             style = MaterialTheme.typography.bodyMedium.copy(
                 fontWeight = FontWeight.Bold,
-                color = Color.White
+                color = MaterialTheme.colorScheme.onSurface
             ),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
         )
         Text(
-            text = release.artist,
+            text = localizedArtistPresentation(release.artist),
             style = MaterialTheme.typography.bodySmall.copy(
-                color = Color.White.copy(alpha = 0.5f)
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             ),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
@@ -2414,6 +2579,7 @@ fun HistorySection(
     history: List<RecentTrack>,
     baseUrl: String,
     token: String,
+    currentTrack: com.example.playback.TrackItem?,
     onTrackClick: (RecentTrack) -> Unit,
     onMoreClick: (RecentTrack) -> Unit
 ) {
@@ -2421,7 +2587,7 @@ fun HistorySection(
         modifier = Modifier.padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        SectionHeader(title = "History")
+        SectionHeader(title = stringResource(R.string.home_section_history))
 
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             history.take(6).forEach { recent ->
@@ -2429,6 +2595,7 @@ fun HistorySection(
                     recent = recent,
                     baseUrl = baseUrl,
                     token = token,
+                    isPlaying = currentTrack?.ratingKey == recent.ratingKey,
                     onClick = { onTrackClick(recent) },
                     onMoreClick = { onMoreClick(recent) }
                 )
@@ -2442,23 +2609,32 @@ fun RecentHistoryRow(
     recent: RecentTrack,
     baseUrl: String,
     token: String,
+    isPlaying: Boolean = false,
     onClick: () -> Unit,
     onMoreClick: () -> Unit
 ) {
     val context = LocalContext.current
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
     val imageUrl = if (recent.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, recent.thumb) else null
+    val activeColor = MaterialTheme.colorScheme.primary
 
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .homeTileGesture(
+                onClickLabel = stringResource(R.string.home_tile_play_accessibility, recent.title),
+                onLongClickLabel = stringResource(R.string.details_more_options_accessibility, recent.title),
                 onClick = onClick,
                 onLongClick = onMoreClick
             ),
         shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.02f)),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.04f))
+        colors = CardDefaults.cardColors(
+            containerColor = if (isPlaying) activeColor.copy(alpha = 0.1f) else MaterialTheme.colorScheme.surface
+        ),
+        border = androidx.compose.foundation.BorderStroke(
+            1.dp,
+            if (isPlaying) activeColor.copy(alpha = 0.3f) else MaterialTheme.colorScheme.outlineVariant
+        )
     ) {
         Row(
             modifier = Modifier
@@ -2470,13 +2646,13 @@ fun RecentHistoryRow(
                 modifier = Modifier.size(48.dp),
                 shape = RoundedCornerShape(10.dp)
             ) {
-                if (imageUrl != null) {
-                    AsyncImage(
-                        model = authenticatedArtworkRequest(context, imageUrl, token),
-                        contentDescription = recent.title,
-                        contentScale = ContentScale.Crop,
-                        modifier = Modifier.fillMaxSize()
-                    )
+                    if (imageUrl != null) {
+                        AsyncImage(
+                            model = authenticatedArtworkRequest(context, imageUrl, token),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
                 } else {
                     Box(
                         modifier = Modifier
@@ -2500,16 +2676,16 @@ fun RecentHistoryRow(
                 Text(
                     text = recent.title,
                     style = MaterialTheme.typography.bodyMedium.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
+                        fontWeight = if (isPlaying) FontWeight.ExtraBold else FontWeight.Bold,
+                        color = if (isPlaying) activeColor else MaterialTheme.colorScheme.onSurface
                     ),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = recent.artist,
+                    text = localizedArtistPresentation(recent.artist),
                     style = MaterialTheme.typography.bodySmall.copy(
-                        color = Color.White.copy(alpha = 0.5f)
+                        color = if (isPlaying) activeColor else MaterialTheme.colorScheme.onSurfaceVariant
                     ),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -2535,14 +2711,14 @@ fun HomeSkeletonLoader() {
             modifier = Modifier
                 .fillMaxWidth()
                 .height(24.dp)
-                .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(6.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(6.dp))
         )
         Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             repeat(3) {
                 Box(
                     modifier = Modifier
                         .size(120.dp)
-                        .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(16.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(16.dp))
                 )
             }
         }
@@ -2550,7 +2726,7 @@ fun HomeSkeletonLoader() {
             modifier = Modifier
                 .width(180.dp)
                 .height(24.dp)
-                .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(6.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(6.dp))
         )
         Row(horizontalArrangement = Arrangement.spacedBy(16.dp)) {
             repeat(2) {
@@ -2558,7 +2734,7 @@ fun HomeSkeletonLoader() {
                     modifier = Modifier
                         .width(200.dp)
                         .height(140.dp)
-                        .background(Color.White.copy(alpha = 0.05f), RoundedCornerShape(20.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(20.dp))
                 )
             }
         }

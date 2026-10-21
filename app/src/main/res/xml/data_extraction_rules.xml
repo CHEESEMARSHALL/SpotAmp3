@@ -5,15 +5,15 @@
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <!-- Backend credentials are device-bound and are intentionally excluded. -->
+        <exclude domain="sharedpref" path="plex_settings_secure.xml" />
+        <exclude domain="sharedpref" path="plex_settings.xml" />
+        <!-- Camera permission history is specific to this OS install and must not restore elsewhere. -->
+        <exclude domain="sharedpref" path="companion_pairing_permissions.xml" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="sharedpref" path="plex_settings_secure.xml" />
+        <exclude domain="sharedpref" path="plex_settings.xml" />
+        <exclude domain="sharedpref" path="companion_pairing_permissions.xml" />
     </device-transfer>
-    -->
 </data-extraction-rules>

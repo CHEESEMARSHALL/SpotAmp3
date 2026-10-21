@@ -12,6 +12,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.MusicNote
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -21,12 +22,16 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.R
 import com.example.playback.Lyrics
 import com.example.playback.LyricLine
+import com.example.playback.activeLineIndex
 
 @Composable
 fun LyricsPanel(
@@ -45,7 +50,6 @@ fun LyricsPanel(
     Box(
         modifier = modifier
             .background(backgroundColor)
-            .clickable { onClose() }
             .testTag("lyrics_panel")
     ) {
         if (loading) {
@@ -69,13 +73,13 @@ fun LyricsPanel(
             ) {
                 Icon(
                     imageVector = Icons.Rounded.MusicNote,
-                    contentDescription = "No Lyrics",
+                    contentDescription = null,
                     tint = onSurfaceColor.copy(alpha = 0.3f),
                     modifier = Modifier.size(48.dp)
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = "No Lyrics Available.",
+                    text = stringResource(R.string.lyrics_empty_message),
                     style = MaterialTheme.typography.bodyLarge.copy(
                         color = onSurfaceColor.copy(alpha = 0.6f),
                         fontWeight = FontWeight.Medium
@@ -93,12 +97,12 @@ fun LyricsPanel(
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.Refresh,
-                        contentDescription = "Reload",
+                        contentDescription = null,
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "Scan / Reload",
+                        text = stringResource(R.string.lyrics_search_action),
                         style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold)
                     )
                 }
@@ -107,13 +111,7 @@ fun LyricsPanel(
             val listState = rememberLazyListState()
             
             // For synced lyrics: find the active line
-            val activeIndex = if (lyrics.isSynced) {
-                lyrics.lines.indexOfLast {
-                    it.timestampMs != null && it.timestampMs <= positionMs
-                }
-            } else {
-                -1
-            }
+            val activeIndex = lyrics.activeLineIndex(positionMs)
 
             // Auto scroll to active index when it changes
             if (lyrics.isSynced && activeIndex >= 0) {
@@ -137,6 +135,7 @@ fun LyricsPanel(
                         key = { index, line -> "${line.timestampMs ?: index}_$index" }
                     ) { index, line ->
                         val isActive = index == activeIndex
+                        val seekTimestampMs = if (lyrics.isSynced) line.timestampMs else null
                         
                         val fontSize by animateFloatAsState(
                             targetValue = if (isActive) 20f else 16f,
@@ -152,10 +151,16 @@ fun LyricsPanel(
 
                         val itemModifier = Modifier
                             .fillMaxWidth()
+                            .then(
+                                if (seekTimestampMs != null) Modifier.heightIn(min = 48.dp) else Modifier
+                            )
                             .clip(RoundedCornerShape(8.dp))
                             .then(
-                                if (lyrics.isSynced && line.timestampMs != null) {
-                                    Modifier.clickable { onSeek(line.timestampMs) }
+                                if (seekTimestampMs != null) {
+                                    Modifier.clickable(
+                                        onClickLabel = stringResource(R.string.lyrics_seek_to_line_accessibility),
+                                        role = Role.Button
+                                    ) { onSeek(seekTimestampMs) }
                                 } else {
                                     Modifier
                                 }
@@ -201,6 +206,21 @@ fun LyricsPanel(
                         .align(Alignment.BottomCenter)
                 )
             }
+        }
+
+        IconButton(
+            onClick = onClose,
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(8.dp)
+                .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                .testTag("lyrics_close")
+        ) {
+            Icon(
+                Icons.Rounded.Close,
+                contentDescription = stringResource(R.string.lyrics_close_accessibility),
+                tint = onSurfaceColor
+            )
         }
     }
 }

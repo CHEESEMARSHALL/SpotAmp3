@@ -1,5 +1,6 @@
 package com.example.ui
 
+import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -22,6 +23,11 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -34,21 +40,189 @@ import coil.request.ImageRequest
 import com.example.data.PlexMedia
 import com.example.data.PlexMetadata
 import com.example.data.PlexPart
+import com.example.data.calculateAlbumPlayStats
+import com.example.data.normalizeCompanionArtistArtworkUrl
+import com.example.data.rankArtistTracksByListens
 import com.example.data.RadioRequest
 import com.example.data.RadioType
+import com.example.data.sortArtistAlbumsChronologically
+import com.example.data.sortAlbumTracksInPlaybackOrder
 import com.example.playback.TrackItem
+import com.example.R
+import androidx.annotation.StringRes
+import java.util.Locale
 
 enum class AlbumCategory {
     ALBUMS, SINGLES_EPS, LIVE_ALBUMS, COMPILATIONS
 }
 
-fun categorizeAlbum(album: PlexMetadata, artistName: String): AlbumCategory {
+fun categorizeAlbum(album: PlexMetadata): AlbumCategory {
     val title = album.title.lowercase()
     return when {
         title.contains("live") || title.contains("royal albert hall") || title.contains("concert") -> AlbumCategory.LIVE_ALBUMS
         title.contains("single") || title.contains(" ep") || title.contains("ep ") || title.contains("(ep)") -> AlbumCategory.SINGLES_EPS
         title.contains("compilation") || title.contains("best of") || title.contains("greatest hits") || title.contains("anthology") -> AlbumCategory.COMPILATIONS
         else -> AlbumCategory.ALBUMS
+    }
+}
+
+internal fun albumPlaytimeLabel(context: Context, totalPlaytimeMs: Long): String {
+    val totalMinutes = totalPlaytimeMs.coerceAtLeast(0L) / 60_000L
+    val hours = (totalMinutes / 60L).toInt()
+    val minutes = (totalMinutes % 60L).toInt()
+    val hourLabel = if (hours > 0) {
+        context.resources.getQuantityString(R.plurals.album_detail_duration_hours, hours, hours)
+    } else {
+        null
+    }
+    val minuteLabel = if (minutes > 0 || hours == 0) {
+        context.resources.getQuantityString(R.plurals.album_detail_duration_minutes, minutes, minutes)
+    } else {
+        null
+    }
+    val durationLabel = when {
+        hourLabel != null && minuteLabel != null -> context.getString(
+            R.string.album_detail_duration_hours_minutes,
+            hourLabel,
+            minuteLabel
+        )
+        hourLabel != null -> hourLabel
+        else -> minuteLabel.orEmpty()
+    }
+    return context.getString(R.string.album_detail_listening_time, durationLabel)
+}
+
+internal fun artistPopularTrackDurationLabel(durationMs: Long?): String? =
+    durationMs?.takeIf { it > 0L }?.let(::formatDuration)
+
+internal fun artistAlbumYearRange(years: Iterable<Int?>): String? {
+    val knownYears = years.filterNotNull().filter { it > 0 }
+    val firstYear = knownYears.minOrNull() ?: return null
+    val lastYear = knownYears.maxOrNull() ?: return null
+    return if (firstYear == lastYear) firstYear.toString() else "$firstYear – $lastYear"
+}
+
+internal fun albumDetailArtistName(albumArtist: String?, trackArtist: String?): String =
+    albumArtist?.takeIf(String::isNotBlank)
+        ?: trackArtist?.takeIf(String::isNotBlank)
+        ?: "Various Artists"
+
+internal fun navigateToSimilarArtist(
+    name: String,
+    artists: List<PlexMetadata>,
+    onNavigateToArtist: (String, String) -> Unit,
+    onNavigateToSearch: (String) -> Unit
+) {
+    val normalizedName = name.trim()
+    if (normalizedName.isEmpty()) return
+
+    val matchedArtist = artists.firstOrNull {
+        it.title.trim().equals(normalizedName, ignoreCase = true)
+    }
+    if (matchedArtist != null) {
+        onNavigateToArtist(matchedArtist.ratingKey, matchedArtist.title)
+    } else {
+        onNavigateToSearch(normalizedName)
+    }
+}
+
+@Composable
+internal fun ArtistDetailSectionHeading(
+    @StringRes titleRes: Int,
+    modifier: Modifier = Modifier
+) {
+    Text(
+        text = stringResource(titleRes).uppercase(Locale.ROOT),
+        style = MaterialTheme.typography.titleSmall.copy(
+            fontWeight = FontWeight.Bold,
+            color = Color.White,
+            letterSpacing = 1.sp
+        ),
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = modifier
+    )
+}
+
+@Composable
+internal fun ArtistStyleRow(
+    styleName: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val accessibilityLabel = stringResource(R.string.artist_detail_play_style_accessibility, styleName)
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable(role = Role.Button, onClick = onClick)
+            .semantics(mergeDescendants = true) { contentDescription = accessibilityLabel }
+            .padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(36.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .background(Color.White.copy(alpha = 0.05f))
+                .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(6.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.ArrowOutward,
+                contentDescription = null,
+                tint = Color.White.copy(alpha = 0.8f),
+                modifier = Modifier.size(16.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.width(16.dp))
+
+        Text(
+            text = styleName,
+            style = MaterialTheme.typography.bodyLarge.copy(
+                fontWeight = FontWeight.Medium,
+                color = Color.White
+            ),
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
+internal fun ArtistDetailPlayButton(
+    artistName: String,
+    isLoading: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val accessibilityLabel = stringResource(R.string.artist_detail_play_accessibility, artistName)
+    val loadingLabel = if (isLoading) stringResource(R.string.player_loading_state) else null
+    Box(
+        modifier = modifier
+            .size(56.dp)
+            .clip(RoundedCornerShape(28.dp))
+            .background(if (isLoading) Color.White.copy(alpha = 0.3f) else Color.White)
+            .clickable(enabled = !isLoading, role = Role.Button, onClick = onClick)
+            .semantics(mergeDescendants = true) {
+                contentDescription = accessibilityLabel
+                if (loadingLabel != null) stateDescription = loadingLabel
+            },
+        contentAlignment = Alignment.Center
+    ) {
+        if (isLoading) {
+            CircularProgressIndicator(
+                color = Color.Black,
+                modifier = Modifier.size(24.dp),
+                strokeWidth = 2.dp
+            )
+        } else {
+            Icon(
+                imageVector = Icons.Rounded.PlayArrow,
+                contentDescription = null,
+                tint = Color.Black,
+                modifier = Modifier.size(28.dp)
+            )
+        }
     }
 }
 
@@ -59,6 +233,7 @@ fun ArtistDetailScreen(
     viewModel: MusicViewModel,
     onNavigateToAlbum: (String, String) -> Unit,
     onNavigateToArtist: (String, String) -> Unit,
+    onNavigateToSearch: (String) -> Unit,
     onBack: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -66,55 +241,107 @@ fun ArtistDetailScreen(
     val currentArtistTracks by viewModel.currentArtistTracks.collectAsStateWithLifecycle()
     val artistProfile by viewModel.artistProfile.collectAsStateWithLifecycle()
     val albums by viewModel.currentArtistAlbums.collectAsStateWithLifecycle()
+    val artistDetailLoadError by viewModel.artistDetailLoadError.collectAsStateWithLifecycle()
+    val listeningHistory by viewModel.listeningHistory.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+    val currentTrack by viewModel.playbackManager.currentTrack.collectAsStateWithLifecycle()
+    val companionConfigured by viewModel.companionConfigured.collectAsStateWithLifecycle()
+    val companionConnectionStatus by viewModel.companionConnectionStatus.collectAsStateWithLifecycle()
 
     var activeContextMenu by remember { mutableStateOf<ContextMenuItem?>(null) }
+    var showPlaylistDialog by remember { mutableStateOf(false) }
+    var tracksToAdd by remember { mutableStateOf<List<TrackItem>>(emptyList()) }
+    var albumIdToAdd by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(artistId) {
-        viewModel.loadArtistDetail(artistId)
+        viewModel.loadArtistDetail(artistId, artistName)
+    }
+    LaunchedEffect(companionConfigured) {
+        if (companionConfigured) viewModel.ensureCompanionReachabilityChecked()
     }
 
     val context = LocalContext.current
     val baseUrl = viewModel.repository.settings.baseUrl
+    val companionBaseUrl = viewModel.repository.settings.companionBackendUrl
+    val isCompanionConfigured = viewModel.repository.settings.isCompanionConfigured
     val token = viewModel.repository.settings.token
     val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
+    val unknownAlbumLabel = stringResource(R.string.common_unknown_album)
 
-    // Find artist avatar from system artists or metadata
+    // Find artist artwork from the authoritative profile/list metadata first,
+    // then try the other catalog references if one source is missing or fails.
     val artistsList by viewModel.artists.collectAsStateWithLifecycle()
     val artistFromList = remember(artistsList, artistId) {
         artistsList.find { it.ratingKey == artistId }
     }
-    val artistThumb = currentArtistMetadata?.thumb ?: artistFromList?.thumb
-    val imageUrl = if (!artistThumb.isNullOrEmpty()) resolveArtworkUrl(baseUrl, artistThumb) else null
+    val artistArtworkUrls = remember(
+        artistId,
+        artistProfile?.artworkUrl,
+        artistFromList?.thumb,
+        currentArtistMetadata?.thumb,
+        baseUrl,
+        companionBaseUrl,
+        isCompanionConfigured
+    ) {
+        val references = if (isCompanionConfigured) {
+            listOfNotNull(
+                artistProfile?.artworkUrl,
+                artistFromList?.thumb,
+                currentArtistMetadata?.thumb
+            )
+        } else {
+            listOfNotNull(currentArtistMetadata?.thumb, artistFromList?.thumb)
+        }
+
+        references.mapNotNull { reference ->
+            val resolved = if (isCompanionConfigured) {
+                normalizeCompanionArtistArtworkUrl(companionBaseUrl, reference)
+            } else {
+                resolveArtworkUrl(baseUrl, reference).takeIf {
+                    it.startsWith("http://", ignoreCase = true) ||
+                        it.startsWith("https://", ignoreCase = true)
+                }
+            }
+            resolved?.takeIf { it.isNotBlank() }
+        }.distinct()
+    }
+    var artistArtworkIndex by remember(artistArtworkUrls) { mutableStateOf(0) }
+    val imageUrl = artistArtworkUrls.getOrNull(artistArtworkIndex)
+    val artistThumb = imageUrl ?: artistArtworkUrls.firstOrNull() ?: ""
 
     // Categorized lists
-    val albumsList = remember(albums) {
-        albums.filter { categorizeAlbum(it, artistName) == AlbumCategory.ALBUMS }
+    val sortedAlbums = remember(albums) {
+        sortArtistAlbumsChronologically(albums)
     }
-    val singlesList = remember(albums) {
-        albums.filter { categorizeAlbum(it, artistName) == AlbumCategory.SINGLES_EPS }
+    val albumsList = remember(sortedAlbums) {
+        sortedAlbums.filter { categorizeAlbum(it) == AlbumCategory.ALBUMS }
     }
-    val liveList = remember(albums) {
-        albums.filter { categorizeAlbum(it, artistName) == AlbumCategory.LIVE_ALBUMS }
+    val singlesList = remember(sortedAlbums) {
+        sortedAlbums.filter { categorizeAlbum(it) == AlbumCategory.SINGLES_EPS }
     }
-    val compilationsList = remember(albums) {
-        albums.filter { categorizeAlbum(it, artistName) == AlbumCategory.COMPILATIONS }
+    val liveList = remember(sortedAlbums) {
+        sortedAlbums.filter { categorizeAlbum(it) == AlbumCategory.LIVE_ALBUMS }
+    }
+    val compilationsList = remember(sortedAlbums) {
+        sortedAlbums.filter { categorizeAlbum(it) == AlbumCategory.COMPILATIONS }
     }
 
-    // Popular tracks
-    val popularTracks = remember(currentArtistTracks) {
-        currentArtistTracks
-            .sortedWith(compareByDescending<PlexMetadata> { it.viewCount ?: 0 }
-                .thenBy { it.index ?: Int.MAX_VALUE }
-                .thenBy { it.ratingKey })
-            .take(5)
+    // Popular tracks are based on actual local listening events, not the
+    // optional viewCount field on a Plex child response.
+    val localPlayCounts = remember(listeningHistory) {
+        listeningHistory.associate { it.ratingKey to it.playCount }
+    }
+    val popularTracks = remember(currentArtistTracks, localPlayCounts) {
+        rankArtistTracksByListens(currentArtistTracks, localPlayCounts)
     }
 
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
+            .statusBarsPadding()
             .background(Color.Transparent)
             .padding(horizontal = 16.dp)
+            .testTag("artist_detail_content")
     ) {
         // Top Header Navigation Bar
         item {
@@ -128,12 +355,13 @@ fun ArtistDetailScreen(
                 IconButton(
                     onClick = onBack,
                     modifier = Modifier
+                        .size(48.dp)
                         .clip(RoundedCornerShape(12.dp))
                         .background(Color.White.copy(alpha = 0.05f))
                 ) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                        contentDescription = "Back",
+                        contentDescription = stringResource(R.string.details_back_accessibility),
                         tint = Color.White
                     )
                 }
@@ -151,19 +379,26 @@ fun ArtistDetailScreen(
                     textAlign = TextAlign.Center
                 )
 
-                IconButton(
-                    onClick = { /* Casting support is not implemented yet. */ },
-                    enabled = false,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color.White.copy(alpha = 0.05f))
-                ) {
-                    Icon(
-                        imageVector = Icons.Rounded.Cast,
-                        contentDescription = "Casting unavailable",
-                        tint = Color.White.copy(alpha = 0.35f)
-                    )
-                }
+            }
+        }
+
+        item {
+            CompanionDetailConnectionNotice(
+                companionConfigured = companionConfigured,
+                status = companionConnectionStatus,
+                onCheckConnection = viewModel::retryCompanionConnection,
+                testTag = "artist_detail_connection_status_notice"
+            )
+        }
+
+        artistDetailLoadError?.let { message ->
+            item {
+                DetailLoadFailureNotice(
+                    message = message,
+                    isRetrying = isLoading,
+                    onRetry = { viewModel.loadArtistDetail(artistId, artistName) },
+                    testTag = "artist_detail_retry_notice"
+                )
             }
         }
 
@@ -186,9 +421,14 @@ fun ArtistDetailScreen(
                     if (imageUrl != null) {
                         AsyncImage(
                             model = authenticatedArtworkRequest(context, imageUrl, token),
-                            contentDescription = artistName,
+                            contentDescription = null,
                             contentScale = ContentScale.Crop,
-                            modifier = Modifier.fillMaxSize()
+                            modifier = Modifier.fillMaxSize(),
+                            onError = {
+                                if (artistArtworkIndex < artistArtworkUrls.lastIndex) {
+                                    artistArtworkIndex++
+                                }
+                            }
                         )
                     } else {
                         Box(
@@ -217,22 +457,11 @@ fun ArtistDetailScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier.padding(end = 16.dp)
                 ) {
-                    // Modern round white Play Button
-                    Box(
-                        modifier = Modifier
-                            .size(56.dp)
-                            .clip(RoundedCornerShape(28.dp))
-                            .background(Color.White)
-                            .clickable { viewModel.playArtist(artistId) },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Rounded.PlayArrow,
-                            contentDescription = "Play Artist",
-                            tint = Color.Black,
-                            modifier = Modifier.size(28.dp)
-                        )
-                    }
+                    ArtistDetailPlayButton(
+                        artistName = artistName,
+                        isLoading = isLoading,
+                        onClick = { viewModel.playArtist(artistId) }
+                    )
 
                     Spacer(modifier = Modifier.height(20.dp))
 
@@ -249,12 +478,13 @@ fun ArtistDetailScreen(
                                     )
                                 )
                             },
-                            modifier = Modifier.size(36.dp)
+                            enabled = !isLoading,
+                            modifier = Modifier.size(48.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Rounded.RssFeed,
-                                contentDescription = "Radio",
-                                tint = Color.White.copy(alpha = 0.6f),
+                                contentDescription = stringResource(R.string.artist_detail_radio_accessibility, artistName),
+                                tint = Color.White.copy(alpha = if (isLoading) 0.2f else 0.6f),
                                 modifier = Modifier.size(22.dp)
                             )
                         }
@@ -263,15 +493,16 @@ fun ArtistDetailScreen(
                                 activeContextMenu = ContextMenuItem.Artist(
                                     ratingKey = artistId,
                                     name = artistName,
-                                    thumb = artistThumb ?: ""
+                                    thumb = artistThumb
                                 )
                             },
-                            modifier = Modifier.size(36.dp)
+                            enabled = !isLoading,
+                            modifier = Modifier.size(48.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Rounded.MoreVert,
-                                contentDescription = "More Options",
-                                tint = Color.White.copy(alpha = 0.6f),
+                                contentDescription = stringResource(R.string.details_more_options_accessibility, artistName),
+                                tint = Color.White.copy(alpha = if (isLoading) 0.2f else 0.6f),
                                 modifier = Modifier.size(22.dp)
                             )
                         }
@@ -280,7 +511,7 @@ fun ArtistDetailScreen(
             }
         }
 
-        if (isLoading && albums.isEmpty()) {
+        if (isLoading) {
             item {
                 Box(
                     modifier = Modifier
@@ -288,20 +519,130 @@ fun ArtistDetailScreen(
                         .height(200.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    CircularProgressIndicator(color = Color(0xFF818CF8))
+                    Text(
+                        text = stringResource(R.string.artist_detail_loading_music),
+                        style = MaterialTheme.typography.bodyMedium.copy(color = Color.White.copy(alpha = 0.4f))
+                    )
                 }
             }
         } else {
-            // 1. ALBUMS CATEGORY LIST
+            // 1. POPULAR TRACKS LIST (Moved to Top)
+            if (popularTracks.isNotEmpty()) {
+                item {
+                    ArtistDetailSectionHeading(
+                        titleRes = R.string.artist_detail_popular_tracks,
+                        modifier = Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 12.dp)
+                    )
+                }
+
+                itemsIndexed(popularTracks) { _, track ->
+                    val isLiked by viewModel.isTrackLikedFlow(track.ratingKey).collectAsStateWithLifecycle(initialValue = false)
+                    val isCurrent = currentTrack?.ratingKey == track.ratingKey
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(if (isCurrent) Color.White.copy(alpha = 0.1f) else Color.Transparent)
+                            .clickable(role = Role.Button) { viewModel.playTrackFromMetadata(track, popularTracks) }
+                            .padding(horizontal = 8.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = track.title,
+                                style = MaterialTheme.typography.bodyLarge.copy(
+                                    fontWeight = if (isCurrent) FontWeight.ExtraBold else FontWeight.Bold,
+                                    color = if (isCurrent) Color(0xFF818CF8) else Color.White
+                                ),
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            artistPopularTrackDurationLabel(track.duration)?.let { durationLabel ->
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = durationLabel,
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = Color.White.copy(alpha = 0.5f)
+                                    )
+                                )
+                            }
+                        }
+
+                        // Like button for popular track
+                        IconButton(
+                            onClick = {
+                                val key = track.media?.firstOrNull()?.part?.firstOrNull()?.key ?: ""
+                                val trackItem = TrackItem(
+                                    ratingKey = track.ratingKey,
+                                    title = track.title,
+                                    artist = track.grandparentTitle?.takeIf(String::isNotBlank) ?: artistName,
+                                    album = track.parentTitle?.takeIf(String::isNotBlank) ?: unknownAlbumLabel,
+                                    key = key,
+                                    thumb = track.thumb ?: "",
+                                    duration = track.duration ?: 0L,
+                                    albumRatingKey = track.parentRatingKey
+                                )
+                                viewModel.toggleLikeTrack(trackItem)
+                            },
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
+                                contentDescription = trackLikeActionDescription(isLiked),
+                                tint = if (isLiked) Color.Red else Color.White.copy(alpha = 0.4f),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+
+                        IconButton(
+                            onClick = {
+                                val key = track.media?.firstOrNull()?.part?.firstOrNull()?.key ?: ""
+                                activeContextMenu = ContextMenuItem.Track(
+                                    ratingKey = track.ratingKey,
+                                    title = track.title,
+                                    artist = track.grandparentTitle?.takeIf(String::isNotBlank) ?: artistName,
+                                    album = track.parentTitle?.takeIf(String::isNotBlank) ?: unknownAlbumLabel,
+                                    key = key,
+                                    thumb = track.thumb ?: "",
+                                    duration = track.duration ?: 0L,
+                                    albumRatingKey = track.parentRatingKey,
+                                    albumArtist = track.albumArtist,
+                                    artistRatingKey = track.grandparentRatingKey
+                                )
+                            },
+                            modifier = Modifier.size(48.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.MoreVert,
+                                contentDescription = stringResource(R.string.details_more_options_accessibility, track.title),
+                                tint = Color.White.copy(alpha = 0.4f),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                }
+
+            }
+
+
+            // 2. ALBUMS CATEGORY LIST
             if (albumsList.isNotEmpty()) {
                 item {
                     val yearRange = remember(albumsList) {
-                        val years = albumsList.mapNotNull { it.year }.filter { it > 0 }
-                        if (years.isNotEmpty()) "${years.minOrNull()} – ${years.maxOrNull()}" else "2006 – 2026"
+                        artistAlbumYearRange(albumsList.map { it.year })
                     }
-                    ArtistSectionHeader(title = "ALBUMS", infoText = yearRange)
+                    ArtistSectionHeader(
+                        titleRes = R.string.library_category_albums,
+                        infoText = yearRange.orEmpty()
+                    )
                 }
-                itemsIndexed(albumsList) { _, album ->
+                items(
+                    count = albumsList.size,
+                    key = { idx -> albumsList[idx].ratingKey },
+                    contentType = { "album" }
+                ) { idx ->
+                    val album = albumsList[idx]
                     ArtistAlbumListItem(
                         album = album,
                         artistName = artistName,
@@ -312,7 +653,7 @@ fun ArtistDetailScreen(
                             activeContextMenu = ContextMenuItem.Album(
                                 ratingKey = album.ratingKey,
                                 title = album.title,
-                                artist = album.parentTitle ?: artistName,
+                                artist = album.parentTitle?.takeIf(String::isNotBlank) ?: artistName,
                                 thumb = album.thumb ?: ""
                             )
                         },
@@ -321,10 +662,10 @@ fun ArtistDetailScreen(
                 }
             }
 
-            // 2. SINGLES & EPs CATEGORY LIST
+            // 3. SINGLES & EPs CATEGORY LIST
             if (singlesList.isNotEmpty()) {
                 item {
-                    ArtistSectionHeader(title = "SINGLES & EPs")
+                    ArtistSectionHeader(titleRes = R.string.artist_detail_singles_eps)
                 }
                 itemsIndexed(singlesList) { _, album ->
                     ArtistAlbumListItem(
@@ -337,7 +678,7 @@ fun ArtistDetailScreen(
                             activeContextMenu = ContextMenuItem.Album(
                                 ratingKey = album.ratingKey,
                                 title = album.title,
-                                artist = album.parentTitle ?: artistName,
+                                artist = album.parentTitle?.takeIf(String::isNotBlank) ?: artistName,
                                 thumb = album.thumb ?: ""
                             )
                         },
@@ -346,10 +687,10 @@ fun ArtistDetailScreen(
                 }
             }
 
-            // 3. LIVE ALBUMS CATEGORY LIST
+            // 4. LIVE ALBUMS CATEGORY LIST
             if (liveList.isNotEmpty()) {
                 item {
-                    ArtistSectionHeader(title = "LIVE ALBUMS")
+                    ArtistSectionHeader(titleRes = R.string.artist_detail_live_albums)
                 }
                 itemsIndexed(liveList) { _, album ->
                     ArtistAlbumListItem(
@@ -362,7 +703,7 @@ fun ArtistDetailScreen(
                             activeContextMenu = ContextMenuItem.Album(
                                 ratingKey = album.ratingKey,
                                 title = album.title,
-                                artist = album.parentTitle ?: artistName,
+                                artist = album.parentTitle?.takeIf(String::isNotBlank) ?: artistName,
                                 thumb = album.thumb ?: ""
                             )
                         },
@@ -371,10 +712,10 @@ fun ArtistDetailScreen(
                 }
             }
 
-            // 4. COMPILATIONS CATEGORY LIST
+            // 5. COMPILATIONS CATEGORY LIST
             if (compilationsList.isNotEmpty()) {
                 item {
-                    ArtistSectionHeader(title = "COMPILATIONS")
+                    ArtistSectionHeader(titleRes = R.string.library_category_compilations)
                 }
                 itemsIndexed(compilationsList) { _, album ->
                     ArtistAlbumListItem(
@@ -387,7 +728,7 @@ fun ArtistDetailScreen(
                             activeContextMenu = ContextMenuItem.Album(
                                 ratingKey = album.ratingKey,
                                 title = album.title,
-                                artist = album.parentTitle ?: artistName,
+                                artist = album.parentTitle?.takeIf(String::isNotBlank) ?: artistName,
                                 thumb = album.thumb ?: ""
                             )
                         },
@@ -396,140 +737,11 @@ fun ArtistDetailScreen(
                 }
             }
 
-            // 5. POPULAR TRACKS LIST
-            if (popularTracks.isNotEmpty()) {
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 28.dp, bottom = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = "POPULAR TRACKS",
-                            style = MaterialTheme.typography.titleSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                                letterSpacing = 1.sp
-                            )
-                        )
-                        Icon(
-                            imageVector = Icons.Rounded.ChevronRight,
-                            contentDescription = "See all popular tracks",
-                            tint = Color.White.copy(alpha = 0.6f),
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                }
-
-                itemsIndexed(popularTracks) { _, track ->
-                    val isLiked by viewModel.isTrackLikedFlow(track.ratingKey).collectAsStateWithLifecycle(initialValue = false)
-
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable { viewModel.playTrackFromMetadata(track, popularTracks) }
-                            .padding(vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = track.title,
-                                style = MaterialTheme.typography.bodyLarge.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    color = Color.White
-                                ),
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = if (track.duration != null && track.duration > 0) formatDuration(track.duration) else "3:45",
-                                style = MaterialTheme.typography.bodySmall.copy(
-                                    color = Color.White.copy(alpha = 0.5f)
-                                )
-                            )
-                        }
-
-                        // Like button for popular track
-                        IconButton(
-                            onClick = {
-                                val key = track.media?.firstOrNull()?.part?.firstOrNull()?.key ?: ""
-                                val trackItem = com.example.playback.TrackItem(
-                                    ratingKey = track.ratingKey,
-                                    title = track.title,
-                                    artist = track.grandparentTitle ?: artistName,
-                                    album = track.parentTitle ?: "Popular Tracks",
-                                    key = key,
-                                    thumb = track.thumb ?: "",
-                                    duration = track.duration ?: 0L,
-                                    albumRatingKey = track.parentRatingKey
-                                )
-                                viewModel.toggleLikeTrack(trackItem)
-                            },
-                            modifier = Modifier.size(36.dp)
-                        ) {
-                            Icon(
-                                imageVector = if (isLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-                                contentDescription = "Like Song",
-                                tint = if (isLiked) Color.Red else Color.White.copy(alpha = 0.4f),
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-
-                        IconButton(
-                            onClick = {
-                                val key = track.media?.firstOrNull()?.part?.firstOrNull()?.key ?: ""
-                                activeContextMenu = ContextMenuItem.Track(
-                                    ratingKey = track.ratingKey,
-                                    title = track.title,
-                                    artist = track.grandparentTitle ?: artistName,
-                                    album = track.parentTitle ?: "Popular Tracks",
-                                    key = key,
-                                    thumb = track.thumb ?: "",
-                                    duration = track.duration ?: 0L,
-                                    albumRatingKey = track.parentRatingKey
-                                )
-                            },
-                            modifier = Modifier.size(36.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.MoreVert,
-                                contentDescription = "Options",
-                                tint = Color.White.copy(alpha = 0.4f),
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                    }
-                }
-
-                // Page indicators for popular tracks
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 12.dp),
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        repeat(4) { index ->
-                            Box(
-                                modifier = Modifier
-                                    .padding(horizontal = 3.dp)
-                                    .size(6.dp)
-                                    .clip(RoundedCornerShape(3.dp))
-                                    .background(if (index == 0) Color.White else Color.White.copy(alpha = 0.2f))
-                            )
-                        }
-                    }
-                }
-            }
-
             // 6. ARTIST BIO
             item {
                 Column(modifier = Modifier.padding(top = 24.dp, bottom = 12.dp)) {
                     Text(
-                        text = "ARTIST BIO",
+                        text = stringResource(R.string.artist_detail_bio_section).uppercase(Locale.ROOT),
                         style = MaterialTheme.typography.titleSmall.copy(
                             fontWeight = FontWeight.Bold,
                             color = Color.White,
@@ -538,7 +750,8 @@ fun ArtistDetailScreen(
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
-                        text = artistProfile?.bio ?: "$artistName is a dominant and incredibly creative force in the music industry, producing legendary records.",
+                        text = artistProfile?.bio?.takeIf { it.isNotBlank() }
+                            ?: stringResource(R.string.artist_detail_bio_unavailable),
                         style = MaterialTheme.typography.bodyMedium.copy(
                             color = Color.White.copy(alpha = 0.6f),
                             lineHeight = 22.sp
@@ -547,45 +760,28 @@ fun ArtistDetailScreen(
                 }
             }
 
+
             // 7. SIMILAR ARTISTS
             val similarList = artistProfile?.similarArtists ?: emptyList()
             if (similarList.isNotEmpty()) {
                 item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 28.dp, bottom = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = "SIMILAR ARTISTS",
-                            style = MaterialTheme.typography.titleSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                                letterSpacing = 1.sp
-                            )
-                        )
-                        Icon(
-                            imageVector = Icons.Rounded.ChevronRight,
-                            contentDescription = "See all similar artists",
-                            tint = Color.White.copy(alpha = 0.6f),
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
+                    ArtistDetailSectionHeading(
+                        titleRes = R.string.artist_detail_similar_artists,
+                        modifier = Modifier.fillMaxWidth().padding(top = 28.dp, bottom = 12.dp)
+                    )
                 }
 
                 itemsIndexed(similarList) { _, similar ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable {
-                                val matchedArtist = artistsList.find { it.title.contains(similar.name, ignoreCase = true) }
-                                if (matchedArtist != null) {
-                                    onNavigateToArtist(matchedArtist.ratingKey, matchedArtist.title)
-                                } else {
-                                    viewModel.search(similar.name)
-                                }
+                            .clickable(role = Role.Button) {
+                                navigateToSimilarArtist(
+                                    name = similar.name,
+                                    artists = artistsList,
+                                    onNavigateToArtist = onNavigateToArtist,
+                                    onNavigateToSearch = onNavigateToSearch
+                                )
                             }
                             .padding(vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -637,112 +833,26 @@ fun ArtistDetailScreen(
             val stylesList = artistProfile?.styles ?: emptyList()
             if (stylesList.isNotEmpty()) {
                 item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 28.dp, bottom = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text(
-                            text = "ARTIST STYLES",
-                            style = MaterialTheme.typography.titleSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
-                                letterSpacing = 1.sp
-                            )
-                        )
-                        Icon(
-                            imageVector = Icons.Rounded.ChevronRight,
-                            contentDescription = "See all artist styles",
-                            tint = Color.White.copy(alpha = 0.6f),
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
+                    ArtistDetailSectionHeading(
+                        titleRes = R.string.artist_detail_styles,
+                        modifier = Modifier.fillMaxWidth().padding(top = 28.dp, bottom = 12.dp)
+                    )
                 }
 
                 itemsIndexed(stylesList) { _, styleName ->
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                            .clickable {
-                                viewModel.playSeededRadio(
-                                    RadioRequest(
-                                        type = RadioType.STYLE_RADIO,
-                                        genre = styleName
-                                    )
+                    ArtistStyleRow(
+                        styleName = styleName,
+                        onClick = {
+                            viewModel.playSeededRadio(
+                                RadioRequest(
+                                    type = RadioType.STYLE_RADIO,
+                                    style = styleName
                                 )
-                            }
-                            .padding(vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(Color.White.copy(alpha = 0.05f))
-                                .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(6.dp)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.ArrowOutward,
-                                contentDescription = null,
-                                tint = Color.White.copy(alpha = 0.8f),
-                                modifier = Modifier.size(16.dp)
                             )
                         }
-                        
-                        Spacer(modifier = Modifier.width(16.dp))
-                        
-                        Text(
-                            text = styleName,
-                            style = MaterialTheme.typography.bodyLarge.copy(
-                                fontWeight = FontWeight.Medium,
-                                color = Color.White
-                            ),
-                            modifier = Modifier.weight(1f)
-                        )
-                        
-                        IconButton(
-                            onClick = {
-                                viewModel.playSeededRadio(
-                                    RadioRequest(
-                                        type = RadioType.STYLE_RADIO,
-                                        genre = styleName
-                                    )
-                                )
-                            },
-                            modifier = Modifier.size(36.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.MoreVert,
-                                contentDescription = "Options",
-                                tint = Color.White.copy(alpha = 0.4f),
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                    }
+                    )
                 }
 
-                // Page indicators for Styles
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 12.dp),
-                        horizontalArrangement = Arrangement.Center
-                    ) {
-                        repeat(2) { index ->
-                            Box(
-                                modifier = Modifier
-                                    .padding(horizontal = 3.dp)
-                                    .size(6.dp)
-                                    .clip(RoundedCornerShape(3.dp))
-                                    .background(if (index == 0) Color.White else Color.White.copy(alpha = 0.2f))
-                            )
-                        }
-                    }
-                }
             }
         }
         
@@ -766,9 +876,9 @@ fun ArtistDetailScreen(
 
 @Composable
 fun ArtistSectionHeader(
-    title: String,
-    infoText: String = "",
-    modifier: Modifier = Modifier
+    @StringRes titleRes: Int,
+    modifier: Modifier = Modifier,
+    infoText: String = ""
 ) {
     Row(
         modifier = modifier
@@ -779,19 +889,12 @@ fun ArtistSectionHeader(
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                text = title,
+                text = stringResource(titleRes).uppercase(Locale.ROOT),
                 style = MaterialTheme.typography.titleSmall.copy(
                     fontWeight = FontWeight.Bold,
                     color = Color.White,
                     letterSpacing = 1.sp
                 )
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Icon(
-                imageVector = Icons.Rounded.MoreHoriz,
-                contentDescription = null,
-                tint = Color.White.copy(alpha = 0.3f),
-                modifier = Modifier.size(16.dp)
             )
         }
         
@@ -819,12 +922,11 @@ fun ArtistAlbumListItem(
 ) {
     val albumThumb = album.thumb
     val imageUrl = if (!albumThumb.isNullOrEmpty()) resolveArtworkUrl(normalizedBaseUrl, albumThumb) else null
-    val stars = if (album.title.contains("POST HUMAN: NeX GEn", ignoreCase = true)) " ★★★★★" else ""
 
     Row(
         modifier = modifier
             .fillMaxWidth()
-            .clickable { onClick() }
+            .clickable(role = Role.Button, onClick = onClick)
             .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -835,7 +937,7 @@ fun ArtistAlbumListItem(
             if (imageUrl != null) {
                 AsyncImage(
                     model = authenticatedArtworkRequest(context, imageUrl, token),
-                    contentDescription = album.title,
+                    contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
                 )
@@ -873,18 +975,13 @@ fun ArtistAlbumListItem(
                 overflow = TextOverflow.Ellipsis
             )
             Spacer(modifier = Modifier.height(2.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "${album.year ?: "Unknown"}",
-                    style = MaterialTheme.typography.bodySmall.copy(
-                        color = Color.White.copy(alpha = 0.5f)
-                    )
-                )
-                if (stars.isNotEmpty()) {
+            val yearText = album.year?.takeIf { it > 0 }?.toString()
+            if (yearText != null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = stars,
+                        text = yearText,
                         style = MaterialTheme.typography.bodySmall.copy(
-                            color = Color(0xFFFBBF24)
+                            color = Color.White.copy(alpha = 0.5f)
                         )
                     )
                 }
@@ -893,11 +990,11 @@ fun ArtistAlbumListItem(
 
         IconButton(
             onClick = onMoreClick,
-            modifier = Modifier.size(36.dp)
+            modifier = Modifier.size(48.dp)
         ) {
             Icon(
                 imageVector = Icons.Rounded.MoreVert,
-                contentDescription = "Options",
+                contentDescription = stringResource(R.string.details_more_options_accessibility, album.title),
                 tint = Color.White.copy(alpha = 0.4f),
                 modifier = Modifier.size(18.dp)
             )
@@ -909,13 +1006,15 @@ fun ArtistAlbumListItem(
 fun AlbumDetailScreen(
     albumId: String,
     albumName: String,
-    seedTracks: List<TrackItem> = emptyList(),
     viewModel: MusicViewModel,
     onBack: () -> Unit,
     onNavigateToArtist: (String, String) -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    seedTracks: List<TrackItem> = emptyList()
 ) {
     val loadedTracks by viewModel.currentAlbumTracks.collectAsStateWithLifecycle()
+    val albumDetailLoadError by viewModel.albumDetailLoadError.collectAsStateWithLifecycle()
+    val listeningHistory by viewModel.listeningHistory.collectAsStateWithLifecycle()
     val seededTrackMetadata = remember(albumId, seedTracks) {
         seedTracks.map { track ->
             PlexMetadata(
@@ -926,30 +1025,61 @@ fun AlbumDetailScreen(
                 thumb = track.thumb.takeIf(String::isNotBlank),
                 parentTitle = track.album,
                 grandparentTitle = track.artist,
+                albumArtist = track.albumArtist ?: track.artist,
+                index = track.index,
+                parentIndex = track.discNumber,
                 duration = track.duration,
                 media = listOf(PlexMedia(listOf(PlexPart(track.key)))),
                 parentRatingKey = track.albumRatingKey
             )
         }
     }
-    val tracks = if (loadedTracks.isNotEmpty()) loadedTracks else seededTrackMetadata
+    // The repository owns canonical disc/track ordering. Preserve it here so
+    // multi-disc albums are not re-sorted as 1,1,2,2 across discs.
+    val finalTracks = remember(loadedTracks, seededTrackMetadata) {
+        sortAlbumTracksInPlaybackOrder(loadedTracks.ifEmpty { seededTrackMetadata })
+    }
+    val albumArtist = albumDetailArtistName(
+        albumArtist = finalTracks.firstOrNull()?.albumArtist,
+        trackArtist = finalTracks.firstOrNull()?.grandparentTitle
+    )
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
+    val currentTrack by viewModel.playbackManager.currentTrack.collectAsStateWithLifecycle()
+    val companionConfigured by viewModel.companionConfigured.collectAsStateWithLifecycle()
+    val companionConnectionStatus by viewModel.companionConnectionStatus.collectAsStateWithLifecycle()
     val context = LocalContext.current
 
+    val localPlayCounts = remember(listeningHistory) {
+        listeningHistory.associate { it.ratingKey to it.playCount }
+    }
+    val albumPlayStats = remember(finalTracks, localPlayCounts) {
+        calculateAlbumPlayStats(finalTracks, localPlayCounts)
+    }
+    val totalPlays = albumPlayStats.totalPlays
+    val totalPlaytimeMs = albumPlayStats.totalPlaytimeMs
+    val playtimeLabel = remember(context, totalPlaytimeMs) {
+        albumPlaytimeLabel(context, totalPlaytimeMs)
+    }
+
     var activeContextMenu by remember { mutableStateOf<ContextMenuItem?>(null) }
+    var showPlaylistDialog by remember { mutableStateOf(false) }
+    var tracksToAdd by remember { mutableStateOf<List<TrackItem>>(emptyList()) }
+    var albumIdToAdd by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(albumId) {
         viewModel.loadAlbumDetail(albumId)
     }
+    LaunchedEffect(companionConfigured) {
+        if (companionConfigured) viewModel.ensureCompanionReachabilityChecked()
+    }
 
     val baseUrl = viewModel.repository.settings.baseUrl
     val token = viewModel.repository.settings.token
-    val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
 
     // Find first track's thumbnail as album art, or use album's own
-    val firstTrackThumb = tracks.firstOrNull()?.thumb
-    val thumbPath = if (!firstTrackThumb.isNullOrEmpty()) firstTrackThumb else null
-    val imageUrl = if (thumbPath != null) resolveArtworkUrl(baseUrl, thumbPath) else null
+    val firstTrackThumb = finalTracks.firstOrNull()?.thumb
+    val thumbPath = firstTrackThumb?.takeIf { it.isNotEmpty() }
+    val imageUrl = thumbPath?.let { resolveArtworkUrl(baseUrl, it) }
 
     Column(
         modifier = modifier
@@ -961,29 +1091,73 @@ fun AlbumDetailScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .weight(1f)
+                .testTag("album_detail_content")
         ) {
+            item {
+                CompanionDetailConnectionNotice(
+                    companionConfigured = companionConfigured,
+                    status = companionConnectionStatus,
+                    onCheckConnection = viewModel::retryCompanionConnection,
+                    testTag = "album_detail_connection_status_notice"
+                )
+            }
+
             // Album Header Graphic Area
             item {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(320.dp)
+                        .height(380.dp) // Slightly taller for mockup style
                 ) {
+                    // Background image
+                    if (imageUrl != null) {
+                        AsyncImage(
+                            model = authenticatedArtworkRequest(context, imageUrl, token),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(
+                                    Brush.linearGradient(
+                                        colors = listOf(Color(0xFF1F2937), Color(0xFF111827))
+                                    )
+                                )
+                        )
+                    }
+
+                    // Overlay for readability
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(
+                                Brush.verticalGradient(
+                                    colors = listOf(
+                                        Color.Black.copy(alpha = 0.4f),
+                                        Color.Transparent,
+                                        Color.Black.copy(alpha = 0.8f)
+                                    )
+                                )
+                            )
+                    )
+
                     // Back button overlay
                     IconButton(
                         onClick = onBack,
                         modifier = Modifier
                             .statusBarsPadding()
                             .padding(16.dp)
-                            .size(40.dp)
+                            .size(48.dp)
                             .clip(RoundedCornerShape(20.dp))
-                            .background(Color.Black.copy(alpha = 0.5f))
+                            .background(Color.Black.copy(alpha = 0.3f))
                             .align(Alignment.TopStart)
-                            .testTag("back_button")
                     ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                            contentDescription = "Back",
+                            contentDescription = stringResource(R.string.details_back_accessibility),
                             tint = Color.White
                         )
                     }
@@ -991,7 +1165,6 @@ fun AlbumDetailScreen(
                     // More options button overlay
                     IconButton(
                         onClick = {
-                            val albumArtist = tracks.firstOrNull()?.grandparentTitle ?: tracks.firstOrNull()?.parentTitle ?: "Various Artists"
                             activeContextMenu = ContextMenuItem.Album(
                                 ratingKey = albumId,
                                 title = albumName,
@@ -1002,197 +1175,194 @@ fun AlbumDetailScreen(
                         modifier = Modifier
                             .statusBarsPadding()
                             .padding(16.dp)
-                            .size(40.dp)
+                            .size(48.dp)
                             .clip(RoundedCornerShape(20.dp))
-                            .background(Color.Black.copy(alpha = 0.5f))
+                            .background(Color.Black.copy(alpha = 0.3f))
                             .align(Alignment.TopEnd)
-                            .testTag("album_more_button")
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.MoreVert,
-                            contentDescription = "More options",
+                            contentDescription = stringResource(R.string.details_more_options_accessibility, albumName),
                             tint = Color.White
                         )
                     }
 
-                    // Background ambient blur if artwork exists
-                    if (imageUrl != null) {
-                        AsyncImage(
-                            model = authenticatedArtworkRequest(context, imageUrl, token),
-                            contentDescription = null,
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .background(Color.Black.copy(alpha = 0.6f))
-                        )
-                    }
-
-                    // Bottom ambient dark overlay gradient
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(
-                                Brush.verticalGradient(
-                                    colors = listOf(
-                                        Color.Transparent,
-                                        Color(0xFF0F0F15).copy(alpha = 0.6f),
-                                        Color(0xFF080808)
-                                    )
-                                )
-                            )
-                    )
-
-                    // Centered Card Cover Art
+                    // Mockup Style Centered Content
                     Column(
                         modifier = Modifier
-                            .fillMaxSize()
-                            .statusBarsPadding()
-                            .padding(top = 16.dp, bottom = 12.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Bottom
+                            .align(Alignment.Center)
+                            .padding(top = 40.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
                     ) {
-                        Card(
-                            modifier = Modifier
-                                .size(140.dp)
-                                .padding(bottom = 12.dp),
-                            shape = RoundedCornerShape(24.dp),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.10f)),
-                            elevation = CardDefaults.cardElevation(defaultElevation = 0.dp)
+                        // Album Title in Capsule
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = Color.Black.copy(alpha = 0.7f),
+                            modifier = Modifier.padding(bottom = 8.dp)
                         ) {
-                            if (imageUrl != null) {
-                                AsyncImage(
-                                    model = authenticatedArtworkRequest(context, imageUrl, token),
-                                    contentDescription = albumName,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            } else {
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .background(
-                                            Brush.linearGradient(
-                                                colors = listOf(Color(0xFF6366F1), Color(0xFF8B5CF6))
-                                            )
-                                        ),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Rounded.Album,
-                                        contentDescription = null,
-                                        tint = Color.White.copy(alpha = 0.2f),
-                                        modifier = Modifier.size(56.dp)
-                                    )
-                                }
-                            }
-                        }
-
-                        Text(
-                            text = albumName,
-                            style = MaterialTheme.typography.headlineSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White,
+                            Text(
+                                text = albumName,
+                                style = MaterialTheme.typography.headlineMedium.copy(
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = Color.White
+                                ),
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                                 textAlign = TextAlign.Center
-                            ),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(horizontal = 24.dp)
-                        )
+                            )
+                        }
 
-                        val albumArtist = tracks.firstOrNull()?.grandparentTitle ?: tracks.firstOrNull()?.parentTitle ?: "Various Artists"
-                        val artistId = tracks.firstOrNull()?.grandparentRatingKey ?: ""
-                        Text(
-                            text = albumArtist,
-                            style = MaterialTheme.typography.titleMedium.copy(
-                                color = Color(0xFF818CF8),
-                                fontWeight = FontWeight.Medium
-                            ),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.clickable {
-                                if (artistId.isNotEmpty()) {
-                                    onNavigateToArtist(artistId, albumArtist)
+                        // Artist Name in Capsule
+                        val artistId = finalTracks.firstOrNull()?.grandparentRatingKey ?: ""
+
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = Color.Black.copy(alpha = 0.7f),
+                            modifier = Modifier
+                                .padding(bottom = 24.dp)
+                                .clickable(role = Role.Button) {
+                                    if (artistId.isNotEmpty()) {
+                                        onNavigateToArtist(artistId, albumArtist)
+                                    }
                                 }
-                            }
-                        )
-                    }
-                }
-            }
+                        ) {
+                            Text(
+                                text = localizedArtistPresentation(albumArtist),
+                                style = MaterialTheme.typography.titleLarge.copy(
+                                    color = Color(0xFF818CF8),
+                                    fontWeight = FontWeight.Bold
+                                ),
+                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+                                textAlign = TextAlign.Center
+                            )
+                        }
 
-            // Quick Play Actions Header
-            if (tracks.isNotEmpty()) {
-                item {
-                    Row(
+                        // Play stats in Capsule
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = Color.Black.copy(alpha = 0.6f)
+                        ) {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp)
+                                ) {
+                                Text(
+                                    text = localizedPlayCountLabel(totalPlays),
+                                    style = MaterialTheme.typography.bodyLarge.copy(
+                                        color = Color.White,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                )
+                                Text(
+                                    text = playtimeLabel,
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        color = Color.White.copy(alpha = 0.9f),
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                )
+                            }
+                        }
+                    }
+
+                    // Action Bar at the bottom of the header
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp)
-                    ) {
-                        // Play All Button
-                        Button(
-                            onClick = { viewModel.playAllTracks(tracks, 0) },
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(46.dp)
-                                .testTag("play_all_button"),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = Color(0xFF6366F1),
-                                contentColor = Color.White
-                            )
-                        ) {
-                            Icon(imageVector = Icons.Rounded.PlayArrow, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Play All", fontWeight = FontWeight.Bold)
-                        }
-
-                        // Shuffle Button
-                        OutlinedButton(
-                            onClick = {
-                                viewModel.playAllTracks(tracks.shuffled(), 0)
-                            },
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(46.dp)
-                                .testTag("shuffle_all_button"),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.outlinedButtonColors(
-                                contentColor = Color.White
-                            ),
-                            border = ButtonDefaults.outlinedButtonBorder.copy()
-                        ) {
-                            Icon(imageVector = Icons.Rounded.Shuffle, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Shuffle", fontWeight = FontWeight.Bold)
-                        }
-                    }
-
-                    OutlinedButton(
-                        onClick = {
-                            viewModel.playSeededRadio(
-                                RadioRequest(
-                                    type = RadioType.ALBUM_RADIO,
-                                    seedAlbum = albumName
+                            .align(Alignment.BottomCenter)
+                            .background(
+                                brush = Brush.verticalGradient(
+                                    colors = listOf(
+                                        Color.Transparent,
+                                        Color.Black.copy(alpha = 0.8f)
+                                    )
                                 )
                             )
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp)
-                            .height(44.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
-                        border = ButtonDefaults.outlinedButtonBorder.copy()
                     ) {
-                        Icon(imageVector = Icons.Rounded.RssFeed, contentDescription = null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Album Radio", fontWeight = FontWeight.Bold)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 20.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            // Large Green Play Button
+                            IconButton(
+                                onClick = { viewModel.playAllTracks(finalTracks, 0) },
+                                modifier = Modifier
+                                    .size(56.dp)
+                                    .clip(RoundedCornerShape(28.dp))
+                                    .background(Color(0xFF22C55E))
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.PlayArrow,
+                                    contentDescription = stringResource(R.string.album_detail_play_all_accessibility, albumName),
+                                    tint = Color.White,
+                                    modifier = Modifier.size(32.dp)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(24.dp))
+
+                            FeedbackIconButton(onClick = { viewModel.playAllTracks(finalTracks.shuffled(), 0) }) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Shuffle,
+                                    contentDescription = stringResource(R.string.album_detail_shuffle_accessibility, albumName),
+                                    tint = Color.White.copy(alpha = 0.7f),
+                                    modifier = Modifier.size(28.dp)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(16.dp))
+
+                            FeedbackIconButton(onClick = {
+                                viewModel.playSeededRadio(
+                                    RadioRequest(
+                                        type = RadioType.ALBUM_RADIO,
+                                        seedAlbum = albumName
+                                    )
+                                )
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Rounded.RssFeed,
+                                    contentDescription = stringResource(R.string.album_detail_radio_accessibility, albumName),
+                                    tint = Color.White.copy(alpha = 0.7f),
+                                    modifier = Modifier.size(28.dp)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.width(16.dp))
+
+                            FeedbackIconButton(onClick = { viewModel.downloadTracksList(finalTracks.mapNotNull { viewModel.mapMetadataToTrackItem(it) }) }) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Download,
+                                    contentDescription = stringResource(R.string.album_detail_download_accessibility, albumName),
+                                    tint = Color.White.copy(alpha = 0.7f),
+                                    modifier = Modifier.size(28.dp)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.weight(1f))
+
+                            FeedbackIconButton(onClick = {
+                                tracksToAdd = finalTracks.mapNotNull { viewModel.mapMetadataToTrackItem(it) }
+                                albumIdToAdd = albumId
+                                showPlaylistDialog = true
+                            }) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Add,
+                                    contentDescription = stringResource(R.string.album_detail_add_to_playlist_accessibility, albumName),
+                                    tint = Color.White.copy(alpha = 0.7f),
+                                    modifier = Modifier.size(32.dp)
+                                )
+                            }
+                        }
                     }
                 }
             }
+
+            // Small spacer before tracks
+            item { Spacer(modifier = Modifier.height(8.dp)) }
 
             // Tracks List
-            if (isLoading && tracks.isEmpty()) {
+            if (isLoading && finalTracks.isEmpty()) {
                 item {
                     Box(
                         modifier = Modifier
@@ -1203,47 +1373,74 @@ fun AlbumDetailScreen(
                         CircularProgressIndicator(color = Color(0xFF818CF8))
                     }
                 }
-            } else if (tracks.isEmpty()) {
+            } else if (finalTracks.isEmpty()) {
                 item {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(150.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Text(
-                            text = "No tracks found in this album.",
-                            style = MaterialTheme.typography.bodyMedium.copy(color = Color.White.copy(alpha = 0.5f))
+                    if (albumDetailLoadError != null) {
+                        DetailLoadFailureNotice(
+                            message = albumDetailLoadError.orEmpty(),
+                            isRetrying = isLoading,
+                            onRetry = { viewModel.loadAlbumDetail(albumId) },
+                            testTag = "album_detail_retry_notice"
                         )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(150.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = stringResource(R.string.album_detail_empty_tracks),
+                                style = MaterialTheme.typography.bodyMedium.copy(color = Color.White.copy(alpha = 0.5f))
+                            )
+                        }
                     }
                 }
             } else {
-                itemsIndexed(tracks) { index, track ->
+                itemsIndexed(finalTracks, key = { _, track -> track.ratingKey }) { index, track ->
                     val key = track.media?.firstOrNull()?.part?.firstOrNull()?.key ?: ""
                     val trackArtistId = track.grandparentRatingKey ?: ""
-                    val trackArtist = track.grandparentTitle ?: "Unknown Artist"
-                    TrackListItem(
-                        index = index + 1,
-                        track = track,
-                        onMoreClick = {
-                            activeContextMenu = ContextMenuItem.Track(
-                                ratingKey = track.ratingKey,
-                                title = track.title,
-                                artist = track.grandparentTitle ?: "Unknown Artist",
-                                album = albumName,
-                                key = key,
-                                thumb = track.thumb ?: "",
-                                duration = track.duration ?: 0L,
-                                albumRatingKey = albumId
+                    val trackArtist = track.grandparentTitle?.takeIf { it.isNotBlank() }
+                        ?: stringResource(R.string.common_unknown_artist)
+                    val isCurrent = currentTrack?.ratingKey == track.ratingKey
+                    Column {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(if (isCurrent) Color.White.copy(alpha = 0.1f) else Color.Transparent)
+                        ) {
+                            TrackListItem(
+                                index = track.index?.takeIf { it > 0 } ?: (index + 1),
+                                track = track,
+                                onMoreClick = {
+                                    activeContextMenu = ContextMenuItem.Track(
+                                        ratingKey = track.ratingKey,
+                                        title = track.title,
+                                        artist = trackArtist,
+                                        album = albumName,
+                                        key = key,
+                                        thumb = track.thumb ?: "",
+                                        duration = track.duration ?: 0L,
+                                        albumRatingKey = albumId,
+                                        albumArtist = track.albumArtist,
+                                        artistRatingKey = track.grandparentRatingKey
+                                    )
+                                },
+                                onClick = {
+                                    viewModel.playTrackFromMetadata(track, finalTracks)
+                                },
+                                onArtistClick = if (trackArtistId.isNotEmpty()) {
+                                    { onNavigateToArtist(trackArtistId, trackArtist) }
+                                } else null
                             )
-                        },
-                        onClick = {
-                            viewModel.playTrackFromMetadata(track, tracks)
-                        },
-                        onArtistClick = if (trackArtistId.isNotEmpty()) {
-                            { onNavigateToArtist(trackArtistId, trackArtist) }
-                        } else null
-                    )
+                        }
+                        HorizontalDivider(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                            thickness = 0.5.dp,
+                            color = Color.White.copy(alpha = 0.05f)
+                        )
+                    }
                 }
             }
         }
@@ -1259,6 +1456,40 @@ fun AlbumDetailScreen(
             onNavigateToAlbum = { _, _ -> }
         )
     }
+
+    if (showPlaylistDialog) {
+        val playlists by viewModel.playlists.collectAsStateWithLifecycle()
+        PlaylistSelectionDialog(
+            playlists = playlists,
+            onDismiss = { showPlaylistDialog = false },
+            onPlaylistSelected = { playlistId ->
+                if (albumIdToAdd != null) {
+                    viewModel.addAlbumToPlaylist(playlistId, albumIdToAdd!!)
+                } else {
+                    tracksToAdd.forEach { track ->
+                        viewModel.addTrackToPlaylist(playlistId, track)
+                    }
+                }
+                showPlaylistDialog = false
+            },
+            onCreateNewPlaylist = { name, onFailure, onCreated ->
+                viewModel.createPlaylist(
+                    name = name,
+                    onFailure = onFailure,
+                    onCreated = { newId ->
+                        if (albumIdToAdd != null) {
+                            viewModel.addAlbumToPlaylist(newId.toInt(), albumIdToAdd!!)
+                        } else {
+                            tracksToAdd.forEach { track ->
+                                viewModel.addTrackToPlaylist(newId.toInt(), track)
+                            }
+                        }
+                        onCreated()
+                    }
+                )
+            }
+        )
+    }
 }
 
 @Composable
@@ -1272,23 +1503,27 @@ fun TrackListItem(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable { onClick() }
+            .clickable(
+                onClickLabel = stringResource(R.string.details_track_play_accessibility, track.title),
+                role = Role.Button,
+                onClick = onClick
+            )
             .padding(vertical = 12.dp, horizontal = 16.dp)
             .testTag("track_item_${track.ratingKey}"),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Track Index Number
+        // Track Index Number - Muted and smaller matching reference
         Text(
             text = index.toString(),
-            style = MaterialTheme.typography.bodyMedium.copy(
-                fontWeight = FontWeight.Bold,
-                color = Color.White.copy(alpha = 0.4f),
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontWeight = FontWeight.Normal,
+                color = Color.White.copy(alpha = 0.3f),
                 textAlign = TextAlign.Center
             ),
-            modifier = Modifier.width(28.dp)
+            modifier = Modifier.width(24.dp)
         )
 
-        Spacer(modifier = Modifier.width(12.dp))
+        Spacer(modifier = Modifier.width(16.dp))
 
         // Title and optional subtitle
         Column(modifier = Modifier.weight(1f)) {
@@ -1302,15 +1537,22 @@ fun TrackListItem(
                 overflow = TextOverflow.Ellipsis
             )
             // Show artist if track has custom artist distinct from album artist
-            val trackArtist = track.grandparentTitle ?: "Unknown Artist"
+            val trackArtist = track.grandparentTitle?.takeIf { it.isNotBlank() }
+                ?: stringResource(R.string.common_unknown_artist)
             Text(
                 text = trackArtist,
-                style = MaterialTheme.typography.bodyMedium.copy(
-                    color = Color.White.copy(alpha = 0.6f)
+                style = MaterialTheme.typography.bodySmall.copy(
+                    color = Color.White.copy(alpha = 0.5f)
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                modifier = if (onArtistClick != null) Modifier.clickable { onArtistClick() } else Modifier
+                modifier = if (onArtistClick != null) {
+                    Modifier.clickable(
+                        onClickLabel = stringResource(R.string.details_artist_open_accessibility, trackArtist),
+                        role = Role.Button,
+                        onClick = onArtistClick
+                    )
+                } else Modifier
             )
         }
 
@@ -1319,8 +1561,8 @@ fun TrackListItem(
         if (durationMs > 0) {
             Text(
                 text = formatDuration(durationMs),
-                style = MaterialTheme.typography.bodyMedium.copy(
-                    color = Color.White.copy(alpha = 0.4f)
+                style = MaterialTheme.typography.bodySmall.copy(
+                    color = Color.White.copy(alpha = 0.35f)
                 ),
                 modifier = Modifier.padding(end = 8.dp)
             )
@@ -1329,12 +1571,13 @@ fun TrackListItem(
         // More Actions Button
         IconButton(
             onClick = onMoreClick,
-            modifier = Modifier.size(36.dp)
+            modifier = Modifier.size(48.dp)
         ) {
             Icon(
                 imageVector = Icons.Rounded.MoreVert,
-                contentDescription = "More options",
-                tint = Color.White.copy(alpha = 0.5f)
+                contentDescription = stringResource(R.string.details_more_options_accessibility, track.title),
+                tint = Color.White.copy(alpha = 0.35f),
+                modifier = Modifier.size(18.dp)
             )
         }
     }

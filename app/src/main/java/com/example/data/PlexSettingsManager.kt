@@ -16,6 +16,7 @@ class PlexSettingsManager(context: Context) {
         private const val KEY_TOKEN = "plex_token"
         private const val KEY_COMPANION_URL = "companion_backend_url"
         private const val KEY_COMPANION_TOKEN = "companion_backend_token"
+        private const val KEY_COMPANION_DEVICE_ID = "companion_backend_device_id"
         private const val KEY_SECTION_ID = "plex_section_id"
         private const val KEY_LIBRARY_NAME = "plex_library_name"
         
@@ -45,23 +46,38 @@ class PlexSettingsManager(context: Context) {
 
     init {
         val legacy = context.getSharedPreferences(LEGACY_PREFS_NAME, Context.MODE_PRIVATE)
-        val masterKey = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
-        prefs = EncryptedSharedPreferences.create(
-            PREFS_NAME,
-            masterKey,
-            context,
-            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
-            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
-        )
-        if (prefs.getString(KEY_TOKEN, null).isNullOrEmpty() && legacy.getString(KEY_TOKEN, null).orEmpty().isNotEmpty()) {
-            val migration = prefs.edit()
-            listOf(KEY_BASE_URL, KEY_TOKEN, KEY_SECTION_ID, KEY_LIBRARY_NAME, KEY_LASTFM_USERNAME, KEY_LASTFM_SESSION_KEY, KEY_LASTFM_API_KEY, KEY_LASTFM_API_SECRET, KEY_LASTFM_PENDING_TOKEN, KEY_THEME, KEY_EQ_PRESET, KEY_AI_PROVIDER).forEach { key ->
-                legacy.getString(key, null)?.let { migration.putString(key, it) }
+        
+        var securedPrefs: SharedPreferences? = null
+        try {
+            val masterKey = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
+            securedPrefs = EncryptedSharedPreferences.create(
+                PREFS_NAME,
+                masterKey,
+                context,
+                EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+            )
+        } catch (e: Exception) {
+            android.util.Log.e("PlexSettingsManager", "Failed to initialize EncryptedSharedPreferences, falling back to legacy", e)
+            // Fallback to legacy or a regular shared preference if encryption fails
+            // This is common on some devices with corrupted keystores or no lock screen
+        }
+        
+        prefs = securedPrefs ?: legacy
+
+        if (securedPrefs != null && prefs.getString(KEY_TOKEN, null).isNullOrEmpty() && legacy.getString(KEY_TOKEN, null).orEmpty().isNotEmpty()) {
+            try {
+                val migration = prefs.edit()
+                listOf(KEY_BASE_URL, KEY_TOKEN, KEY_COMPANION_URL, KEY_COMPANION_TOKEN, KEY_COMPANION_DEVICE_ID, KEY_SECTION_ID, KEY_LIBRARY_NAME, KEY_LASTFM_USERNAME, KEY_LASTFM_SESSION_KEY, KEY_LASTFM_API_KEY, KEY_LASTFM_API_SECRET, KEY_LASTFM_PENDING_TOKEN, KEY_THEME, KEY_EQ_PRESET, KEY_AI_PROVIDER).forEach { key ->
+                    try { legacy.getString(key, null)?.let { migration.putString(key, it) } } catch (e: Exception) {}
+                }
+                listOf(KEY_LASTFM_ENABLED, KEY_LASTFM_NOW_PLAYING, KEY_LASTFM_SCROBBLE, KEY_LASTFM_PRIVATE, KEY_GAPLESS, KEY_EQ_ENABLED, KEY_NORMALIZATION).forEach { key ->
+                    try { if (legacy.contains(key)) migration.putBoolean(key, legacy.getBoolean(key, false)) } catch (e: Exception) {}
+                }
+                migration.apply()
+            } catch (e: Exception) {
+                android.util.Log.e("PlexSettingsManager", "Error during preferences migration", e)
             }
-            listOf(KEY_LASTFM_ENABLED, KEY_LASTFM_NOW_PLAYING, KEY_LASTFM_SCROBBLE, KEY_LASTFM_PRIVATE, KEY_GAPLESS, KEY_EQ_ENABLED, KEY_NORMALIZATION).forEach { key ->
-                if (legacy.contains(key)) migration.putBoolean(key, legacy.getBoolean(key, false))
-            }
-            migration.apply()
         }
     }
 
@@ -117,12 +133,13 @@ class PlexSettingsManager(context: Context) {
         set(value) = prefs.edit().putBoolean(KEY_NORMALIZATION, value).apply()
 
     var aiProvider: String
-        get() = prefs.getString(KEY_AI_PROVIDER, "CloudAIProvider") ?: "CloudAIProvider"
+        get() = prefs.getString(KEY_AI_PROVIDER, "LocalAIProvider") ?: "LocalAIProvider"
         set(value) = prefs.edit().putString(KEY_AI_PROVIDER, value).apply()
 
     var offlineOnly: Boolean
         get() = prefs.getBoolean(KEY_OFFLINE_ONLY, false)
         set(value) = prefs.edit().putBoolean(KEY_OFFLINE_ONLY, value).apply()
+
 
     var aiModelPath: String
         get() = prefs.getString(KEY_AI_MODEL_PATH, "") ?: ""
@@ -141,23 +158,11 @@ class PlexSettingsManager(context: Context) {
         set(value) = prefs.edit().putString(KEY_GGUF_MODEL_SIZE, value).apply()
 
     var baseUrl: String
-        get() {
-            val saved = prefs.getString(KEY_BASE_URL, "") ?: ""
-            if (saved.isNotEmpty()) return saved
-            // Fallback to BuildConfig if configured and is not default placeholder
-            val envUrl = BuildConfig.PLEX_BASE_URL
-            return if (envUrl.isNotEmpty() && !envUrl.contains("localhost")) envUrl else ""
-        }
+        get() = prefs.getString(KEY_BASE_URL, "") ?: ""
         set(value) = prefs.edit().putString(KEY_BASE_URL, value).apply()
 
     var token: String
-        get() {
-            val saved = prefs.getString(KEY_TOKEN, "") ?: ""
-            if (saved.isNotEmpty()) return saved
-            // Fallback to BuildConfig if configured and is not default placeholder
-            val envToken = BuildConfig.PLEX_TOKEN
-            return if (envToken.isNotEmpty() && !envToken.contains("YOUR_PLEX_TOKEN")) envToken else ""
-        }
+        get() = prefs.getString(KEY_TOKEN, "") ?: ""
         set(value) = prefs.edit().putString(KEY_TOKEN, value).apply()
 
     var companionBackendUrl: String
@@ -168,15 +173,55 @@ class PlexSettingsManager(context: Context) {
         get() = prefs.getString(KEY_COMPANION_TOKEN, "") ?: ""
         set(value) = prefs.edit().putString(KEY_COMPANION_TOKEN, value).apply()
 
+    var companionDeviceId: String
+        get() = prefs.getString(KEY_COMPANION_DEVICE_ID, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_COMPANION_DEVICE_ID, value).apply()
+
+    /** Stores a newly claimed credential as one preference transaction. */
+    fun saveCompanionCredential(url: String, deviceId: String, token: String) {
+        val normalizedUrl = normalizeCompanionUrl(url, allowPrivateHttp = true)
+        val oldOrigin = companionOrigin(companionBackendUrl)
+        val newOrigin = companionOrigin(normalizedUrl)
+        val originChanged = oldOrigin != null && newOrigin != null && oldOrigin != newOrigin
+        if (originChanged && token.trim() == companionBackendToken.trim()) {
+            clearCompanionCredential()
+            throw IllegalArgumentException("SpotCore endpoint changed; scan a fresh Add Device QR code")
+        }
+        prefs.edit()
+            .putString(KEY_COMPANION_URL, normalizedUrl)
+            .putString(KEY_COMPANION_DEVICE_ID, deviceId.trim().ifBlank { companionDeviceIdFromToken(token).orEmpty() })
+            .putString(KEY_COMPANION_TOKEN, token.trim())
+            .apply()
+    }
+
+    fun clearCompanionCredential() {
+        prefs.edit()
+            .remove(KEY_COMPANION_URL)
+            .remove(KEY_COMPANION_DEVICE_ID)
+            .remove(KEY_COMPANION_TOKEN)
+            .apply()
+    }
+
     val isCompanionConfigured: Boolean
         get() = companionBackendUrl.isNotBlank() && companionBackendToken.isNotBlank()
 
+    val isPlexConfigured: Boolean
+        get() = baseUrl.isNotEmpty() && token.isNotEmpty()
+
     var sectionId: String
-        get() = prefs.getString(KEY_SECTION_ID, "") ?: ""
+        get() {
+            val saved = prefs.getString(KEY_SECTION_ID, "") ?: ""
+            if (saved.isNotEmpty()) return saved
+            return if (isCompanionConfigured) "spotcore" else ""
+        }
         set(value) = prefs.edit().putString(KEY_SECTION_ID, value).apply()
 
     var libraryName: String
-        get() = prefs.getString(KEY_LIBRARY_NAME, "") ?: ""
+        get() {
+            val saved = prefs.getString(KEY_LIBRARY_NAME, "") ?: ""
+            if (saved.isNotEmpty()) return saved
+            return if (isCompanionConfigured) "SpotCore" else ""
+        }
         set(value) = prefs.edit().putString(KEY_LIBRARY_NAME, value).apply()
 
     var lyricsDirectory: String
@@ -184,5 +229,5 @@ class PlexSettingsManager(context: Context) {
         set(value) = prefs.edit().putString("lyrics_directory", value).apply()
 
     val isConfigured: Boolean
-        get() = baseUrl.isNotEmpty() && token.isNotEmpty()
+        get() = (baseUrl.isNotEmpty() && token.isNotEmpty()) || isCompanionConfigured
 }

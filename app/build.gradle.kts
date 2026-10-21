@@ -12,6 +12,7 @@ plugins {
 
 android {
   namespace = "com.example"
+  testBuildType = "qa"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
@@ -22,32 +23,64 @@ android {
     versionName = "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    buildConfigField("boolean", "QA_BUILD", "false")
   }
 
+  val releaseKeystorePath = System.getenv("KEYSTORE_PATH")?.takeIf { it.isNotBlank() }
+  // Resolve relative KEYSTORE_PATH values from the repository root, while preserving absolute paths.
+  val releaseKeystore = releaseKeystorePath?.let { rootProject.file(it) }
+  val releaseStorePassword = System.getenv("STORE_PASSWORD")
+  val releaseKeyPassword = System.getenv("KEY_PASSWORD")
+  val releaseSigningReady = releaseKeystore?.isFile == true &&
+    !releaseStorePassword.isNullOrBlank() && !releaseKeyPassword.isNullOrBlank()
+  if (!releaseSigningReady) {
+    logger.lifecycle("Production release signing disabled: explicit KEYSTORE_PATH, STORE_PASSWORD, and KEY_PASSWORD are required")
+  }
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
-      storeFile = file(keystorePath)
-      storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
-      keyPassword = System.getenv("KEY_PASSWORD")
-    }
-    create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
+      if (releaseSigningReady) {
+        storeFile = releaseKeystore!!
+        storePassword = releaseStorePassword
+        keyAlias = System.getenv("KEY_ALIAS")?.takeIf { it.isNotBlank() } ?: "upload"
+        keyPassword = releaseKeyPassword
+      }
     }
   }
 
   buildTypes {
+    debug {
+    }
+    create("qa") {
+      initWith(getByName("debug"))
+      applicationIdSuffix = ".qa"
+      versionNameSuffix = "-qa"
+      resValue("string", "app_name", "SpotAmp QA")
+      buildConfigField("boolean", "QA_BUILD", "true")
+      signingConfig = signingConfigs.getByName("debug")
+      matchingFallbacks += listOf("debug")
+    }
+    create("benchmark") {
+      initWith(getByName("debug"))
+      applicationIdSuffix = ".benchmark"
+      versionNameSuffix = "-benchmark"
+      isDebuggable = false
+      signingConfig = signingConfigs.getByName("debug")
+      matchingFallbacks += listOf("debug")
+    }
     release {
       isCrunchPngs = false
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      signingConfig = signingConfigs.getByName("release")
+      signingConfig = if (releaseSigningReady) signingConfigs.getByName("release") else null
     }
-    // Use the Android Gradle Plugin's default debug keystore for local builds.
+  }
+  sourceSets {
+    getByName("debug").kotlin.directories.add("src/sharedQa/java")
+    getByName("debug").res.directories.add("src/sharedQa/res")
+    getByName("qa").kotlin.directories.add("src/sharedQa/java")
+    getByName("qa").res.directories.add("src/sharedQa/res")
+    getByName("release").kotlin.directories.add("src/nonQa/java")
+    getByName("benchmark").kotlin.directories.add("src/nonQa/java")
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
@@ -56,8 +89,22 @@ android {
   buildFeatures {
     compose = true
     buildConfig = true
+    resValues = true
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
+}
+
+ksp {
+  arg("room.schemaLocation", "$projectDir/schemas")
+  arg("room.incremental", "true")
+}
+
+kotlin {
+  compilerOptions {
+    // Make Moshi/Room constructor annotations explicit under Kotlin's future
+    // default and keep build output focused on actionable warnings.
+    freeCompilerArgs.add("-Xannotation-default-target=param-property")
+  }
 }
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
@@ -76,10 +123,10 @@ dependencies {
   implementation(platform(libs.firebase.bom))
   // implementation(libs.accompanist.permissions)
   implementation(libs.androidx.activity.compose)
-  // implementation(libs.androidx.camera.camera2)
-  // implementation(libs.androidx.camera.core)
-  // implementation(libs.androidx.camera.lifecycle)
-  // implementation(libs.androidx.camera.view)
+  implementation(libs.androidx.camera.camera2)
+  implementation(libs.androidx.camera.core)
+  implementation(libs.androidx.camera.lifecycle)
+  implementation(libs.androidx.camera.view)
   implementation(libs.androidx.compose.material.icons.core)
   implementation(libs.androidx.compose.material.icons.extended)
   implementation(libs.androidx.compose.material3)
@@ -98,8 +145,8 @@ dependencies {
   implementation(libs.androidx.security.crypto)
   implementation(libs.coil.compose)
   implementation(libs.androidx.media3.exoplayer)
+  implementation(libs.androidx.media3.datasource.okhttp)
   implementation(libs.converter.moshi)
-  implementation(libs.firebase.ai)
   // Uncomment to use Firestore:
   // implementation(libs.firebase.firestore)
 
@@ -117,6 +164,7 @@ dependencies {
   implementation(libs.logging.interceptor)
   implementation(libs.moshi.kotlin)
   implementation(libs.okhttp)
+  implementation(libs.zxing.core)
   // implementation(libs.play.services.location)
   implementation(libs.retrofit)
   testImplementation(libs.androidx.compose.ui.test.junit4)
@@ -128,11 +176,13 @@ dependencies {
   testImplementation(libs.roborazzi)
   testImplementation(libs.roborazzi.compose)
   testImplementation(libs.roborazzi.junit.rule)
+  add("qaImplementation", libs.androidx.compose.ui.test.manifest)
   androidTestImplementation(platform(libs.androidx.compose.bom))
   androidTestImplementation(libs.androidx.compose.ui.test.junit4)
   androidTestImplementation(libs.androidx.espresso.core)
   androidTestImplementation(libs.androidx.junit)
   androidTestImplementation(libs.androidx.runner)
+  androidTestUtil("androidx.test.services:test-services:1.6.0")
   debugImplementation(libs.androidx.compose.ui.test.manifest)
   debugImplementation(libs.androidx.compose.ui.tooling)
   "ksp"(libs.androidx.room.compiler)

@@ -4,25 +4,44 @@ import com.example.playback.TrackItem
 
 /**
  * Converts SpotCore's companion contract into the existing phone-side Home
- * model. Empty companion collections deliberately preserve their Plex-backed
- * equivalents so a partial server response cannot make Home less useful.
+ * model. A successful companion response is authoritative: local Room data is
+ * only used by the caller when the request itself fails. This prevents a
+ * partial/empty server response from silently reintroducing alphabetical local
+ * shelves beside the real server recommendations.
  */
 object BackendHomeMapper {
-    fun track(dto: BackendTrackDto): TrackItem = TrackItem(
-        ratingKey = "companion:${dto.id}",
-        title = dto.title,
-        artist = dto.artist,
-        album = dto.album,
-        key = dto.streamUrl,
-        thumb = dto.coverUrl,
-        duration = dto.duration,
-        genres = dto.genre?.takeIf(String::isNotBlank)?.let(::listOf).orEmpty(),
-        albumRatingKey = albumNavigationKey(dto.artist, dto.album)
-    )
+    fun track(
+        dto: BackendTrackDto,
+        artworkBaseUrl: String = ""
+    ): TrackItem {
+        val albumArtist = effectiveAlbumArtist(dto.albumArtist, dto.artist)
+        return TrackItem(
+            ratingKey = "companion:${dto.id}",
+            title = dto.title,
+            artist = dto.artist,
+            album = dto.album,
+            key = resolveCompanionMediaReference(artworkBaseUrl, dto.streamUrl),
+            thumb = normalizeCompanionArtworkUrl(
+                companionBaseUrl = artworkBaseUrl,
+                trackId = dto.id,
+                coverUrl = dto.coverUrl
+            ),
+            duration = dto.duration.toLong(),
+            index = dto.resolvedTrackNumber(),
+            discNumber = dto.resolvedDiscNumber(),
+            genres = dto.genre?.takeIf(String::isNotBlank)?.let(::listOf).orEmpty(),
+            albumRatingKey = albumNavigationKey(albumArtist, dto.album),
+            albumArtist = albumArtist
+        )
+    }
 
-    fun merge(response: BackendHomeFeedResponse, fallback: HomeFeedState): HomeFeedState {
+    fun merge(
+        response: BackendHomeFeedResponse,
+        fallback: HomeFeedState,
+        artworkBaseUrl: String = ""
+    ): HomeFeedState {
         val recent = response.recentlyPlayed.orEmpty().map { dto ->
-            val item = track(dto)
+            val item = track(dto, artworkBaseUrl)
             HomeRecentPlay(
                 id = "companion-recent:${dto.id}",
                 title = item.title,
@@ -38,22 +57,41 @@ object BackendHomeMapper {
                 id = mix.id,
                 title = mix.title,
                 reason = mix.reason,
-                tracks = mix.tracks.map(::track),
+                tracks = mix.tracks.map { track(it, artworkBaseUrl) },
                 colors = mix.colors.mapNotNull(::parseColor).ifEmpty {
                     listOf(0xFF4F46E5, 0xFF06B6D4)
                 }
             )
         }.filter { it.tracks.isNotEmpty() }
+        val recentlyAdded = response.recentlyAdded.orEmpty().map { album ->
+            PlexMetadata(
+                ratingKey = albumNavigationKey(album.albumArtist ?: album.artist, album.title),
+                title = album.title,
+                type = "album",
+                thumb = normalizeCompanionArtworkUrl(
+                    companionBaseUrl = artworkBaseUrl,
+                    trackId = album.tracks.firstOrNull()?.id.orEmpty(),
+                    coverUrl = album.coverUrl
+                ),
+                parentTitle = album.albumArtist ?: album.artist,
+                albumArtist = album.albumArtist ?: album.artist,
+                year = album.year
+            )
+        }.distinctBy { it.ratingKey }
+        val seenAlbumIds = recentlyAdded.map { it.ratingKey }.toMutableSet()
         val albumShelves = buildList {
-            response.dailyMixes.orEmpty().forEach { mix ->
-                val albums = mix.albums.map(::album).filter { it.tracks.isNotEmpty() }
-                if (albums.isNotEmpty()) add(AlbumRecommendationShelf(mix.id, mix.title, mix.reason, albums))
-            }
             response.madeForYou.orEmpty().forEach { row ->
-                val albums = row.albums.map(::album).filter { it.tracks.isNotEmpty() }
+                val albums = row.albums
+                    .map { album(it, artworkBaseUrl) }
+                    .filter { it.tracks.isNotEmpty() }
+                    .filter { seenAlbumIds.add(it.id) }
                 if (albums.isNotEmpty()) add(AlbumRecommendationShelf(row.id, row.title, row.description, albums))
             }
         }
+        val albumShelfRowIds = response.madeForYou.orEmpty()
+            .filter { row -> row.albums.any { it.tracks.isNotEmpty() } }
+            .map { it.id }
+            .toSet()
         val stations = response.stations.orEmpty().mapNotNull { station ->
             val type = radioType(station.type) ?: return@mapNotNull null
             RecommendedStation(
@@ -72,57 +110,62 @@ object BackendHomeMapper {
                 title = item.title,
                 description = item.description,
                 artists = item.artists,
-                tracks = item.tracks.map(::track),
-                thumb = item.coverUrl
+                tracks = sortTrackItemsInPlaybackOrder(item.tracks.map { track(it, artworkBaseUrl) }),
+                thumb = normalizeCompanionArtworkUrl(
+                    companionBaseUrl = artworkBaseUrl,
+                    trackId = item.tracks.firstOrNull()?.id.orEmpty(),
+                    coverUrl = item.coverUrl
+                )
             )
-        }.filter { it.tracks.isNotEmpty() }
-        val recentlyAdded = response.recentlyAdded.orEmpty().map { album ->
-            PlexMetadata(
-                ratingKey = albumNavigationKey(album.artist, album.title),
-                title = album.title,
-                type = "album",
-                thumb = album.coverUrl,
-                parentTitle = album.artist,
-                year = album.year
-            )
-        }
+        }.filter { it.tracks.isNotEmpty() && it.id !in albumShelfRowIds }
         val onThisDay = response.onThisDay?.takeIf { it.tracks.isNotEmpty() }?.let { item ->
             OnThisDayItem(
                 title = item.albumTitle,
                 artist = item.artist,
                 year = item.year,
                 timeAgo = item.timeAgo,
-                thumb = item.coverUrl,
-                tracks = item.tracks.map(::track),
+                thumb = normalizeCompanionArtworkUrl(
+                    companionBaseUrl = artworkBaseUrl,
+                    trackId = item.tracks.firstOrNull()?.id.orEmpty(),
+                    coverUrl = item.coverUrl
+                ),
+                tracks = item.tracks.map { track(it, artworkBaseUrl) },
                 matchReason = item.matchReason
             )
         }
-        val hasCompanionContent = recent.isNotEmpty() || mixes.isNotEmpty() ||
-            stations.isNotEmpty() || madeForYou.isNotEmpty() ||
-            recentlyAdded.isNotEmpty() || onThisDay != null || albumShelves.isNotEmpty()
-
-        if (!hasCompanionContent) return fallback
-        return fallback.copy(
-            recentPlays = recent.ifEmpty { fallback.recentPlays },
-            recentlyAdded = recentlyAdded.ifEmpty { fallback.recentlyAdded },
-            dailyMixes = mixes.ifEmpty { fallback.dailyMixes },
-            stations = stations.ifEmpty { fallback.stations },
-            madeForYou = madeForYou.ifEmpty { fallback.madeForYou },
-            albumShelves = albumShelves.ifEmpty { fallback.albumShelves },
-            onThisDay = onThisDay ?: fallback.onThisDay,
+        return HomeFeedState(
+            recentPlays = recent,
+            recentlyAdded = recentlyAdded,
+            dailyMixes = mixes,
+            stations = stations,
+            madeForYou = madeForYou,
+            albumShelves = albumShelves,
+            onThisDay = onThisDay,
             source = HomeFeedSource.SPOTCORE
         )
     }
 
-    private fun album(dto: BackendAlbumDto): AlbumRecommendation {
-        val albumKey = albumNavigationKey(dto.artist, dto.title)
+    private fun album(
+        dto: BackendAlbumDto,
+        artworkBaseUrl: String
+    ): AlbumRecommendation {
+        val albumArtist = effectiveAlbumArtist(dto.albumArtist, dto.artist)
+        val albumKey = albumNavigationKey(albumArtist, dto.title)
         return AlbumRecommendation(
             id = albumKey,
             title = dto.title,
-            artist = dto.artist,
-            thumb = dto.coverUrl,
+            artist = albumArtist,
+            thumb = normalizeCompanionArtworkUrl(
+                companionBaseUrl = artworkBaseUrl,
+                trackId = dto.tracks.firstOrNull()?.id.orEmpty(),
+                coverUrl = dto.coverUrl
+            ),
             year = dto.year,
-            tracks = dto.tracks.map(::track).map { it.copy(albumRatingKey = albumKey) }
+            tracks = sortTrackItemsInPlaybackOrder(
+                dto.tracks.map { track(it, artworkBaseUrl) }.map {
+                    it.copy(albumRatingKey = albumKey, albumArtist = albumArtist)
+                }
+            )
         )
     }
 

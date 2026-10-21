@@ -16,7 +16,14 @@ class PlaybackStateRestorationTest {
             TrackItem("remote", "Remote", "Artist", "Album", "/stream", "", 1000),
             TrackItem("local", "Local", "Artist", "Album", "/stream", "", 1000, "missing.mp3")
         )
-        val state = PlaybackStateEntity(queueJson = Json.encodeToString(queue), currentIndex = 99, positionMs = -20L, shuffleEnabled = true, repeatMode = 2)
+        val state = PlaybackStateEntity(
+            queueJson = Json.encodeToString(queue),
+            currentIndex = 99,
+            positionMs = -20L,
+            shuffleEnabled = true,
+            repeatMode = 2,
+            playWhenReady = true
+        )
 
         val restored = PlaybackStateRestoration.restore(state) { false }
 
@@ -25,6 +32,7 @@ class PlaybackStateRestorationTest {
         assertEquals(0L, restored?.positionMs)
         assertEquals(true, restored?.shuffleEnabled)
         assertEquals(2, restored?.repeatMode)
+        assertEquals(true, restored?.playWhenReady)
     }
 
     @Test

@@ -14,6 +14,8 @@ import com.example.data.BackendClientManager
 import com.example.data.BackendPlaybackEventRequest
 import com.example.data.MusicDatabase
 import com.example.data.PlexSettingsManager
+import com.example.data.DeliveryOutcome
+import com.example.data.RetryIdempotencyPolicy
 import com.example.playback.TrackItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -89,9 +91,14 @@ class CompanionPlaySyncWorker(
             val dao = MusicDatabase.getDatabase(applicationContext).musicDao()
             val service = BackendClientManager.getApiService(settings.companionBackendUrl)
             var shouldRetry = false
+            val accountIdentity = com.example.data.SyncAccountIsolationPolicy.identity(
+                settings.companionBackendUrl,
+                settings.companionDeviceId
+            )?.let { "${it.backendOrigin}|${it.accountId}" }
+                ?: return@withContext Result.success()
 
             while (!shouldRetry) {
-                val pending = dao.getPendingCompanionPlays(COMPANION_PLAY_BATCH_SIZE)
+                val pending = dao.getPendingCompanionPlays(accountIdentity, COMPANION_PLAY_BATCH_SIZE)
                 if (pending.isEmpty()) break
 
                 for (event in pending) {
@@ -100,15 +107,20 @@ class CompanionPlaySyncWorker(
                             BackendPlaybackEventRequest(
                                 trackId = event.trackId,
                                 playedAt = event.playedAt,
-                                eventId = event.eventId
+                                eventId = event.eventId,
+                                listenedMs = event.listenedMs
                             ),
                             userAuthToken = "Bearer ${settings.companionBackendToken}"
                         )
-                        dao.deletePendingCompanionPlay(event.eventId)
+                        if (RetryIdempotencyPolicy.shouldRemovePendingEvent(DeliveryOutcome.CONFIRMED)) {
+                            dao.deletePendingCompanionPlay(RetryIdempotencyPolicy.eventIdForRetry(event.eventId))
+                        }
                     } catch (error: HttpException) {
                         if (error.code() == 404) {
                             Log.w("CompanionPlaySync", "SpotCore rejected unknown track ${event.trackId}; dropping pending event")
-                            dao.deletePendingCompanionPlay(event.eventId)
+                            if (RetryIdempotencyPolicy.shouldRemovePendingEvent(DeliveryOutcome.CONFIRMED)) {
+                            dao.deletePendingCompanionPlay(RetryIdempotencyPolicy.eventIdForRetry(event.eventId))
+                        }
                             continue
                         }
                         Log.w("CompanionPlaySync", "SpotCore play delivery failed with HTTP ${error.code()}", error)

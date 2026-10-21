@@ -1,0 +1,23 @@
+{
+  "contractVersion": "1.4",
+  "playlist": {
+    "id": "playlist-fixture-1",
+    "name": "Night Drive",
+    "createdAt": 1700000000000,
+    "updatedAt": 1700000000042,
+    "trackCount": 1,
+    "totalDuration": 210250,
+    "tracks": [
+      {
+        "id": "track-42",
+        "title": "Blue Signal",
+        "artist": "Northstar",
+        "album": "Night Drive",
+        "streamUrl": "/api/v1/media/stream/track-42",
+        "coverUrl": "/api/v1/media/art/track-42",
+        "duration": 210250,
+        "position": 0
+      }
+    ]
+  }
+}

@@ -1,6 +1,6 @@
 {
-  "name": "Plex Music Player",
-  "description": "Plexamp-inspired music player for Plex libraries with Gemini-powered intelligent playlist generation.",
+  "name": "SpotAmp",
+  "description": "A private music player powered by SpotCore with local playlist intelligence.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }

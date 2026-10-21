@@ -1,7 +1,6 @@
 package com.example.playback
 
 import android.app.*
-import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.drawable.BitmapDrawable
@@ -9,18 +8,30 @@ import android.os.Build
 import android.os.IBinder
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
+import androidx.media3.common.Player
 import coil.Coil
 import coil.request.ImageRequest
 import com.example.data.PlexSettingsManager
+import com.example.data.originCredentialsForUrl
+import com.example.data.QaNetworkPolicy
+import com.example.BuildConfig
+import com.example.R
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.collectLatest
+
+private data class PlaybackNotificationState(
+    val track: TrackItem?,
+    val isPlaying: Boolean,
+    val canSkipToNext: Boolean
+)
 
 class MusicPlaybackService : Service() {
 
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private lateinit var playbackManager: PlaybackManager
     private lateinit var mediaSession: MediaSession
-    private var isServiceRunning = false
 
     companion object {
         const val CHANNEL_ID = "music_playback_channel_id"
@@ -36,8 +47,12 @@ class MusicPlaybackService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        playbackManager = PlaybackManager.getInstance(this)
         createNotificationChannel()
+        // startForegroundService() has a short platform deadline. Publish a
+        // lightweight notification before initializing Media3 and its observers.
+        startInitialForeground()
+
+        playbackManager = PlaybackManager.getInstance(this)
         mediaSession = MediaSession(this, "SpotAmpPlayback").apply {
             setCallback(object : MediaSession.Callback() {
                 override fun onPlay() = playbackManager.play()
@@ -53,10 +68,10 @@ class MusicPlaybackService : Service() {
 
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!isServiceRunning) {
-            isServiceRunning = true
-            startInitialForeground()
-        }
+        // The playback observer may detach the foreground notification while
+        // keeping this started service alive. Every new start command must
+        // therefore re-promote immediately rather than trusting object lifetime.
+        startInitialForeground()
         intent?.action?.let { action ->
             when (action) {
                 ACTION_START -> {
@@ -68,11 +83,7 @@ class MusicPlaybackService : Service() {
                 ACTION_NEXT -> playbackManager.next()
                 ACTION_STOP -> {
                     playbackManager.pause()
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                    } else {
-                        stopForeground(true)
-                    }
+                    stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
             }
@@ -88,9 +99,10 @@ class MusicPlaybackService : Service() {
             Notification.Builder(this)
         }
         val notification = notificationBuilder
-            .setContentTitle("SpotAmp")
-            .setContentText("Preparing playback...")
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText(getString(R.string.notification_playback_preparing))
             .setSmallIcon(android.R.drawable.ic_media_play)
+            .setCategory(Notification.CATEGORY_TRANSPORT)
             .setOngoing(true)
             .build()
 
@@ -109,39 +121,41 @@ class MusicPlaybackService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "Music Playback",
+                getString(R.string.notification_playback_channel_name),
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Controls and info for currently playing music"
+                description = getString(R.string.notification_playback_channel_description)
                 setShowBadge(false)
             }
-            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
             manager.createNotificationChannel(channel)
         }
     }
 
     private fun observePlaybackState() {
         serviceScope.launch {
-            // Observe the track changes
-            playbackManager.currentTrack.collectLatest { track ->
+            combine(
+                playbackManager.currentTrack,
+                playbackManager.isPlaying,
+                playbackManager.queue,
+                playbackManager.currentIndex,
+                playbackManager.repeatMode
+            ) { track, isPlaying, queue, currentIndex, repeatMode ->
+                PlaybackNotificationState(
+                    track = track,
+                    isPlaying = isPlaying,
+                    canSkipToNext = PlaybackControlAvailability.canSkipToNext(
+                        queueSize = queue.size,
+                        currentIndex = currentIndex,
+                        repeatAll = repeatMode == Player.REPEAT_MODE_ALL
+                    )
+                )
+            }.collectLatest { state ->
+                val track = state.track
                 if (track != null) {
-                    showNotification(track, playbackManager.isPlaying.value)
+                    showNotification(track, state.isPlaying, state.canSkipToNext)
                 } else {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                    } else {
-                        stopForeground(true)
-                    }
-                }
-            }
-        }
-
-        serviceScope.launch {
-            // Observe the playing status changes
-            playbackManager.isPlaying.collectLatest { isPlaying ->
-                val track = playbackManager.currentTrack.value
-                if (track != null) {
-                    showNotification(track, isPlaying)
+                    stopForeground(STOP_FOREGROUND_REMOVE)
                 }
             }
         }
@@ -150,12 +164,11 @@ class MusicPlaybackService : Service() {
     private var lastLoadedThumbUrl: String? = null
     private var lastLoadedBitmap: Bitmap? = null
 
-    private suspend fun showNotification(track: TrackItem, isPlaying: Boolean) {
+    private suspend fun showNotification(track: TrackItem, isPlaying: Boolean, canSkipToNext: Boolean) {
         var largeIcon: Bitmap? = null
         val baseUrlVal = playbackManager.baseUrl
         val tokenVal = playbackManager.token
         val settings = PlexSettingsManager(this)
-        val companionBase = settings.companionBackendUrl.trimEnd('/')
 
         if (track.thumb.isNotEmpty()) {
             val normalizedBaseUrl = if (baseUrlVal.endsWith("/")) baseUrlVal.dropLast(1) else baseUrlVal
@@ -164,13 +177,15 @@ class MusicPlaybackService : Service() {
             } else {
                 "$normalizedBaseUrl${track.thumb}"
             }
-            val isCompanionArtwork = companionBase.isNotBlank() &&
-                (imageUrl == companionBase || imageUrl.startsWith("$companionBase/"))
-            val hasArtworkCredentials = if (isCompanionArtwork) {
-                settings.companionBackendToken.isNotBlank()
-            } else {
-                baseUrlVal.isNotBlank() && tokenVal.isNotBlank()
-            }
+            val credentials = originCredentialsForUrl(
+                imageUrl,
+                settings.companionBackendUrl,
+                settings.companionBackendToken,
+                baseUrlVal,
+                tokenVal
+            )
+            val artworkAllowed = imageUrl.toHttpUrlOrNull()?.let { QaNetworkPolicy.isAllowed(it) } ?: !BuildConfig.QA_BUILD
+            val hasArtworkCredentials = credentials.headers.isNotEmpty() && artworkAllowed
 
             if (hasArtworkCredentials && imageUrl == lastLoadedThumbUrl && lastLoadedBitmap != null) {
                 largeIcon = lastLoadedBitmap
@@ -178,11 +193,8 @@ class MusicPlaybackService : Service() {
                 try {
                     val imageLoader = Coil.imageLoader(this)
                     val request = ImageRequest.Builder(this).data(imageUrl).apply {
-                        if (isCompanionArtwork) {
-                            addHeader("Authorization", "Bearer ${settings.companionBackendToken}")
-                        } else {
-                            addHeader("X-Plex-Token", tokenVal)
-                        }
+                        credentials.headers
+                            .forEach { (name, value) -> addHeader(name, value) }
                     }.allowHardware(false).build()
                     val result = withContext(Dispatchers.IO) {
                         imageLoader.execute(request)
@@ -199,57 +211,29 @@ class MusicPlaybackService : Service() {
             }
         }
 
-        val playPauseAction = if (isPlaying) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-                Notification.Action.Builder(
-                    android.R.drawable.ic_media_pause,
-                    "Pause",
-                    getPendingIntent(ACTION_PAUSE)
-                ).build()
-            } else {
-                null
-            }
-        } else {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-                Notification.Action.Builder(
-                    android.R.drawable.ic_media_play,
-                    "Play",
-                    getPendingIntent(ACTION_PLAY)
-                ).build()
-            } else {
-                null
-            }
-        }
+        val playPauseAction = Notification.Action.Builder(
+            if (isPlaying) android.R.drawable.ic_media_pause else android.R.drawable.ic_media_play,
+            getString(if (isPlaying) R.string.notification_action_pause else R.string.notification_action_play),
+            getPendingIntent(if (isPlaying) ACTION_PAUSE else ACTION_PLAY)
+        ).build()
 
-        val prevAction = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-            Notification.Action.Builder(
-                android.R.drawable.ic_media_previous,
-                "Previous",
-                getPendingIntent(ACTION_PREV)
-            ).build()
-        } else {
-            null
-        }
+        val prevAction = Notification.Action.Builder(
+            android.R.drawable.ic_media_previous,
+            getString(R.string.notification_action_previous),
+            getPendingIntent(ACTION_PREV)
+        ).build()
 
-        val nextAction = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-            Notification.Action.Builder(
-                android.R.drawable.ic_media_next,
-                "Next",
-                getPendingIntent(ACTION_NEXT)
-            ).build()
-        } else {
-            null
-        }
+        val nextAction = Notification.Action.Builder(
+            android.R.drawable.ic_media_next,
+            getString(R.string.notification_action_next),
+            getPendingIntent(ACTION_NEXT)
+        ).build()
 
-        val stopAction = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-            Notification.Action.Builder(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                "Stop",
-                getPendingIntent(ACTION_STOP)
-            ).build()
-        } else {
-            null
-        }
+        val stopAction = Notification.Action.Builder(
+            android.R.drawable.ic_menu_close_clear_cancel,
+            getString(R.string.notification_action_stop),
+            getPendingIntent(ACTION_STOP)
+        ).build()
 
         val openAppIntent = packageManager.getLaunchIntentForPackage(packageName)
         val contentPendingIntent = PendingIntent.getActivity(
@@ -271,6 +255,7 @@ class MusicPlaybackService : Service() {
             .setContentText("${track.artist} — ${track.album}")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setContentIntent(contentPendingIntent)
+            .setCategory(Notification.CATEGORY_TRANSPORT)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setShowWhen(false)
             .setOngoing(isPlaying)
@@ -279,11 +264,11 @@ class MusicPlaybackService : Service() {
             notificationBuilder.setLargeIcon(largeIcon)
         }
 
-        val actions = PlaybackState.ACTION_PLAY or
+        var actions = PlaybackState.ACTION_PLAY or
             PlaybackState.ACTION_PAUSE or
-            PlaybackState.ACTION_SKIP_TO_NEXT or
             PlaybackState.ACTION_SKIP_TO_PREVIOUS or
             PlaybackState.ACTION_STOP
+        if (canSkipToNext) actions = actions or PlaybackState.ACTION_SKIP_TO_NEXT
         mediaSession.setPlaybackState(
             PlaybackState.Builder()
                 .setActions(actions)
@@ -296,18 +281,19 @@ class MusicPlaybackService : Service() {
                 .build()
         )
 
-        if (prevAction != null) notificationBuilder.addAction(prevAction)
-        if (playPauseAction != null) notificationBuilder.addAction(playPauseAction)
-        if (nextAction != null) notificationBuilder.addAction(nextAction)
-        if (stopAction != null) notificationBuilder.addAction(stopAction)
+        notificationBuilder.addAction(prevAction)
+        notificationBuilder.addAction(playPauseAction)
+        if (canSkipToNext) notificationBuilder.addAction(nextAction)
+        notificationBuilder.addAction(stopAction)
 
         // Set MediaStyle
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            val mediaStyle = Notification.MediaStyle()
-                .setMediaSession(mediaSession.sessionToken)
-                .setShowActionsInCompactView(0, 1, 2)
-            notificationBuilder.setStyle(mediaStyle)
+        val mediaStyle = Notification.MediaStyle().setMediaSession(mediaSession.sessionToken)
+        if (canSkipToNext) {
+            mediaStyle.setShowActionsInCompactView(0, 1, 2)
+        } else {
+            mediaStyle.setShowActionsInCompactView(0, 1)
         }
+        notificationBuilder.setStyle(mediaStyle)
 
         val notification = notificationBuilder.build()
 
@@ -322,13 +308,8 @@ class MusicPlaybackService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
         } else {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_DETACH)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(false)
-            }
-            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            stopForeground(STOP_FOREGROUND_DETACH)
+            val notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
             notificationManager.notify(NOTIFICATION_ID, notification)
         }
     }
@@ -337,11 +318,7 @@ class MusicPlaybackService : Service() {
         val intent = Intent(this, MusicPlaybackService::class.java).apply {
             this.action = action
         }
-        val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        } else {
-            PendingIntent.FLAG_UPDATE_CURRENT
-        }
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         return PendingIntent.getService(this, action.hashCode(), intent, flags)
     }
 
@@ -349,7 +326,6 @@ class MusicPlaybackService : Service() {
         mediaSession.isActive = false
         mediaSession.release()
         super.onDestroy()
-        isServiceRunning = false
         serviceScope.cancel()
     }
 

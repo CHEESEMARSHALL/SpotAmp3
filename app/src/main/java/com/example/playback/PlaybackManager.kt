@@ -8,12 +8,18 @@ import androidx.annotation.OptIn
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.audio.AudioSink
+import androidx.media3.exoplayer.audio.DefaultAudioSink
+import androidx.media3.exoplayer.audio.TeeAudioProcessor
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.DefaultDataSource
 import com.example.data.MusicDao
 import com.example.data.PlexSettingsManager
+import com.example.data.resolveCompanionMediaReference
+import com.example.data.SyncAccountIsolationPolicy
 import com.example.data.RecentTrack
 import com.example.data.LastFmScrobbler
 import kotlinx.coroutines.*
@@ -30,7 +36,11 @@ import com.example.data.ListeningHistoryEntity
 import com.example.data.PendingCompanionPlayEntity
 import com.example.sync.CompanionPlaySyncScheduler
 import com.example.sync.spotCoreTrackId
+import com.example.data.isExactCompanionOrigin
+import com.example.data.isExactOrigin
+import com.example.R
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 @Serializable
 data class TrackItem(
@@ -39,16 +49,42 @@ data class TrackItem(
     val artist: String,
     val album: String,
     val key: String, // e.g. "/library/parts/123/..."
-    val thumb: String, // e.g. "/library/metadata/456/thumb/..."
+    val thumb: String, // e.g. an authenticated companion artwork URL
     val duration: Long,
     val localPath: String? = null,
     val genres: List<String> = emptyList(),
-    val albumRatingKey: String? = null
+    val albumRatingKey: String? = null,
+    val albumArtist: String? = null,
+    val artistRatingKey: String? = null,
+    val index: Int = 0,
+    val discNumber: Int = 1
 )
 
+private class OfflineTrackUnavailableException : IllegalStateException()
+
+enum class PlaybackFailureKind {
+    RETRYABLE,
+    LOCAL_FILE_MISSING,
+    AUDIO_UNPLAYABLE
+}
+
+object PlaybackFailurePolicy {
+    fun classify(errorCode: Int): PlaybackFailureKind = when (errorCode) {
+        androidx.media3.common.PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND ->
+            PlaybackFailureKind.LOCAL_FILE_MISSING
+        androidx.media3.common.PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
+        androidx.media3.common.PlaybackException.ERROR_CODE_DECODING_FAILED,
+        androidx.media3.common.PlaybackException.ERROR_CODE_PARSING_CONTAINER_MALFORMED,
+        androidx.media3.common.PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED ->
+            PlaybackFailureKind.AUDIO_UNPLAYABLE
+        else -> PlaybackFailureKind.RETRYABLE
+    }
+}
+
+@OptIn(UnstableApi::class)
 class PlaybackManager private constructor(private val appContext: Context) {
     private var exoPlayer: ExoPlayer? = null
-    private var httpDataSourceFactory: DefaultHttpDataSource.Factory? = null
+    private var httpDataSourceFactory: OriginAwareHttpDataSourceFactory? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val _currentTrack = MutableStateFlow<TrackItem?>(null)
@@ -56,6 +92,8 @@ class PlaybackManager private constructor(private val appContext: Context) {
 
     private val _queue = MutableStateFlow<List<TrackItem>>(emptyList())
     val queue: StateFlow<List<TrackItem>> = _queue.asStateFlow()
+
+    private var originalQueue: List<TrackItem> = emptyList()
 
     private val _currentIndex = MutableStateFlow<Int>(-1)
     val currentIndex: StateFlow<Int> = _currentIndex.asStateFlow()
@@ -65,6 +103,15 @@ class PlaybackManager private constructor(private val appContext: Context) {
 
     private val _isLoading = MutableStateFlow<Boolean>(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+
+    private val _playbackError = MutableStateFlow<String?>(null)
+    val playbackError: StateFlow<String?> = _playbackError.asStateFlow()
+    private val _playbackErrorRetryable = MutableStateFlow(false)
+    val playbackErrorRetryable: StateFlow<Boolean> = _playbackErrorRetryable.asStateFlow()
+    private val _playbackErrorOfflineTrackMissing = MutableStateFlow(false)
+    val playbackErrorOfflineTrackMissing: StateFlow<Boolean> = _playbackErrorOfflineTrackMissing.asStateFlow()
+    private val _playbackErrorDiagnostic = MutableStateFlow<String?>(null)
+    val playbackErrorDiagnostic: StateFlow<String?> = _playbackErrorDiagnostic.asStateFlow()
 
     private val _progress = MutableStateFlow<Long>(0L)
     val progress: StateFlow<Long> = _progress.asStateFlow()
@@ -84,10 +131,19 @@ class PlaybackManager private constructor(private val appContext: Context) {
     private val _lyricsLoading = MutableStateFlow<Boolean>(false)
     val lyricsLoading: StateFlow<Boolean> = _lyricsLoading.asStateFlow()
 
+    private val _visualizerFrame = MutableStateFlow(PlaybackVisualizerFrame.silence())
+    internal val visualizerFrame: StateFlow<PlaybackVisualizerFrame> = _visualizerFrame.asStateFlow()
+    private val visualizerCapture = PlaybackVisualizerCapture(publishFrame = { frame ->
+        _visualizerFrame.value = frame
+    })
+    private val visualizerPlaybackGate = PlaybackVisualizerPlaybackGate(visualizerCapture)
+
     // Database helper to insert into recently played history
     private var musicDao: MusicDao? = null
     private val coroutineScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val historyMutex = Mutex()
+    private val playbackStateMutex = Mutex()
+    private val playbackStateWriteSequence = AtomicLong(0L)
     @Volatile private var lastPersistAt = 0L
 
     // Base URL & Token reference (populated from Settings)
@@ -101,6 +157,9 @@ class PlaybackManager private constructor(private val appContext: Context) {
     private var hasScrobbledCurrent = false
     private var currentTrackCompleted = false
     private var currentPlayEventId: String? = null
+    private var currentPlayStartedAt = 0L
+    private val listeningDuration = PlaybackListenDurationAccumulator()
+    private var companionEventQueued = false
 
     // Equalizer & Audio processing
     private var equalizer: android.media.audiofx.Equalizer? = null
@@ -140,11 +199,7 @@ class PlaybackManager private constructor(private val appContext: Context) {
     }
 
     private fun updateHttpRequestHeaders() {
-        val headers = buildMap {
-            if (token.isNotBlank()) put("X-Plex-Token", token)
-            if (companionToken.isNotBlank()) put("Authorization", "Bearer $companionToken")
-        }
-        httpDataSourceFactory?.setDefaultRequestProperties(headers)
+        // Credentials are resolved per URI by OriginAwareHttpDataSourceFactory.
     }
 
     fun setMusicDao(dao: MusicDao) {
@@ -156,8 +211,16 @@ class PlaybackManager private constructor(private val appContext: Context) {
     }
 
     private suspend fun restorePlaybackState() {
+        // Do not overwrite an active in-memory session when an Activity or
+        // service reconnects to the singleton. This commonly happens when a
+        // background-playback test (or a real user) returns to the app while
+        // a track is already playing; persisted state is only a startup
+        // fallback, not a competing source of truth.
+        if (_currentTrack.value != null || _queue.value.isNotEmpty() || _isPlaying.value) return
         val state = musicDao?.getPlaybackState() ?: return
-        val restored = PlaybackStateRestoration.restore(state) ?: return
+        val restored = PlaybackStateRestoration.restore(state) { track ->
+            track.localPath.isNullOrBlank() || File(track.localPath).isFile
+        } ?: return
         _queue.value = restored.queue
         _currentIndex.value = restored.currentIndex
         val track = restored.queue[restored.currentIndex]
@@ -165,48 +228,110 @@ class PlaybackManager private constructor(private val appContext: Context) {
         _progress.value = restored.positionMs
         _shuffleModeEnabled.value = restored.shuffleEnabled
         _repeatMode.value = restored.repeatMode
+        _isPlaying.value = restored.playWhenReady
         mainHandler.post {
-            exoPlayer?.shuffleModeEnabled = restored.shuffleEnabled
-            exoPlayer?.repeatMode = restored.repeatMode
+            val player = exoPlayer ?: return@post
+            val mediaItems = buildMediaItems(restored.queue, baseUrl.trimEnd('/'), retryableOnFailure = true)
+                ?: return@post
+            player.stop()
+            player.clearMediaItems()
+            player.addMediaItems(mediaItems)
+            player.shuffleModeEnabled = false
+            player.repeatMode = restored.repeatMode
+            player.seekTo(restored.currentIndex, restored.positionMs)
+            player.prepare()
+            player.playWhenReady = restored.playWhenReady
+            applyAudioEffects()
         }
         loadLyricsForTrack(track)
+        persistPlaybackState(force = true)
     }
 
-    private fun persistPlaybackState() {
+    private fun persistPlaybackState(force: Boolean = false) {
         val now = System.currentTimeMillis()
-        if (now - lastPersistAt < 2000L) return
+        if (!force && now - lastPersistAt < 2000L) return
         lastPersistAt = now
+        val stateSnapshot = PlaybackStateEntity(
+            queueJson = Json.encodeToString(_queue.value),
+            currentIndex = _currentIndex.value,
+            positionMs = _progress.value,
+            shuffleEnabled = _shuffleModeEnabled.value,
+            repeatMode = _repeatMode.value,
+            playWhenReady = _isPlaying.value
+        )
+        val writeSequence = playbackStateWriteSequence.incrementAndGet()
         coroutineScope.launch {
-            val dao = musicDao ?: return@launch
-            dao.savePlaybackState(
-                PlaybackStateEntity(
-                    queueJson = Json.encodeToString(_queue.value),
-                    currentIndex = _currentIndex.value,
-                    positionMs = _progress.value,
-                    shuffleEnabled = _shuffleModeEnabled.value,
-                    repeatMode = _repeatMode.value
-                )
-            )
+            playbackStateMutex.withLock {
+                if (writeSequence == playbackStateWriteSequence.get()) {
+                    musicDao?.savePlaybackState(stateSnapshot)
+                }
+            }
         }
     }
 
     private fun initializePlayer() {
         if (exoPlayer != null) return
 
-        val httpFactory = DefaultHttpDataSource.Factory()
+        val httpFactory = OriginAwareHttpDataSourceFactory(
+            plexBaseUrl = { baseUrl },
+            plexToken = { token },
+            companionBaseUrl = { PlexSettingsManager(appContext).companionBackendUrl },
+            companionToken = { companionToken }
+        )
         httpDataSourceFactory = httpFactory
         updateHttpRequestHeaders()
-        exoPlayer = ExoPlayer.Builder(appContext)
+        val audioAttributes = androidx.media3.common.AudioAttributes.Builder()
+            .setUsage(androidx.media3.common.C.USAGE_MEDIA)
+            .setContentType(androidx.media3.common.C.AUDIO_CONTENT_TYPE_MUSIC)
+            .build()
+
+        val renderersFactory = object : DefaultRenderersFactory(appContext) {
+            override fun buildAudioSink(
+                context: Context,
+                enableFloatOutput: Boolean,
+                enableAudioTrackPlaybackParams: Boolean
+            ): AudioSink = DefaultAudioSink.Builder(context)
+                .setEnableFloatOutput(enableFloatOutput)
+                .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
+                .setAudioProcessors(arrayOf(TeeAudioProcessor(visualizerCapture)))
+                .build()
+        }
+
+        exoPlayer = ExoPlayer.Builder(appContext, renderersFactory)
             // Route local file:// downloads through FileDataSource and remote Plex media
             // through the authenticated HTTP factory.
             .setMediaSourceFactory(DefaultMediaSourceFactory(DefaultDataSource.Factory(appContext, httpFactory)))
+            .setAudioAttributes(audioAttributes, true)
+            .setHandleAudioBecomingNoisy(true)
             .build().apply {
+            setPauseAtEndOfMediaItems(!PlexSettingsManager(appContext).gaplessEnabled)
             addListener(object : Player.Listener {
                 override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
-                    // Keep diagnostics actionable without logging authenticated URLs or tokens.
-                    android.util.Log.e("PlaybackManager", "Playback failed: ${error.errorCodeName} (${error.message ?: "no message"})")
+                    // Media3 exception messages may include the source URI; keep this diagnostic
+                    // to its stable code name so authenticated URLs and track data stay private.
+                    android.util.Log.e("PlaybackManager", "Playback failed: ${error.errorCodeName}")
+                    _currentTrack.value?.let { finalizeCompanionPlayEvent(it) }
+                    visualizerCapture.setEnabled(false, clearFrameWhenDisabled = true)
+                    _playbackErrorDiagnostic.value = error.errorCodeName
                     _isPlaying.value = false
                     _isLoading.value = false
+                    when (PlaybackFailurePolicy.classify(error.errorCode)) {
+                        PlaybackFailureKind.LOCAL_FILE_MISSING -> {
+                            _playbackError.value = appContext.getString(R.string.playback_local_file_missing)
+                            _playbackErrorRetryable.value = false
+                            _playbackErrorOfflineTrackMissing.value = true
+                        }
+                        PlaybackFailureKind.AUDIO_UNPLAYABLE -> {
+                            _playbackError.value = appContext.getString(R.string.playback_audio_unplayable)
+                            _playbackErrorRetryable.value = false
+                            _playbackErrorOfflineTrackMissing.value = false
+                        }
+                        PlaybackFailureKind.RETRYABLE -> {
+                            _playbackError.value = appContext.getString(R.string.playback_error_generic)
+                            _playbackErrorRetryable.value = true
+                            _playbackErrorOfflineTrackMissing.value = false
+                        }
+                    }
                 }
 
                 override fun onAudioSessionIdChanged(audioSessionId: Int) {
@@ -215,6 +340,8 @@ class PlaybackManager private constructor(private val appContext: Context) {
 
                 override fun onIsPlayingChanged(playing: Boolean) {
                     _isPlaying.value = playing
+                    updateVisualizerCaptureForPlayback(playing)
+                    listeningDuration.resetSample()
                     if (playing) {
                         startProgressUpdates()
                         // Start Foreground Service to prevent background suspend and show controls
@@ -244,6 +371,10 @@ class PlaybackManager private constructor(private val appContext: Context) {
                             _duration.value = duration
                         }
                     }
+                    if (state == Player.STATE_ENDED) {
+                        visualizerCapture.setEnabled(false, clearFrameWhenDisabled = true)
+                        _currentTrack.value?.let { finalizeCompanionPlayEvent(it) }
+                    }
                 }
 
                 override fun onPositionDiscontinuity(
@@ -252,6 +383,7 @@ class PlaybackManager private constructor(private val appContext: Context) {
                     reason: Int
                 ) {
                     _progress.value = newPosition.positionMs
+                    listeningDuration.resetSample()
                 }
 
                 override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -262,25 +394,38 @@ class PlaybackManager private constructor(private val appContext: Context) {
                                 if (previous.ratingKey != ratingKey && !currentTrackCompleted) {
                                     recordListeningEvent(previous, completed = false, skipped = true)
                                 }
+                                finalizeCompanionPlayEvent(previous)
                             }
-                            val track = _queue.value.find { it.ratingKey == ratingKey }
+                            val playerIndex = exoPlayer?.currentMediaItemIndex ?: -1
+                            val track = _queue.value.getOrNull(playerIndex)
+                                ?.takeIf { it.ratingKey == ratingKey }
+                                ?: _queue.value.firstOrNull { it.ratingKey == ratingKey }
                             if (track != null) {
                                 _currentTrack.value = track
-                                val idx = _queue.value.indexOfFirst { it.ratingKey == ratingKey }
+                                val idx = playerIndex.takeIf {
+                                    it in _queue.value.indices && _queue.value[it].ratingKey == ratingKey
+                                } ?: _queue.value.indexOfFirst { it.ratingKey == ratingKey }
                                 if (idx != -1) {
                                     _currentIndex.value = idx
                                 }
                                 _duration.value = track.duration
                                 saveToRecentlyPlayed(track)
                                 currentTrackCompleted = false
+                                currentPlayStartedAt = System.currentTimeMillis()
                                 currentPlayEventId = UUID.randomUUID().toString()
-                                recordListeningEvent(track, completed = false, skipped = false, playEventId = currentPlayEventId)
+                                listeningDuration.reset()
+                                companionEventQueued = false
+                                if (exoPlayer?.isPlaying == true) {
+                                    listeningDuration.sample(android.os.SystemClock.elapsedRealtime(), isPlaying = true)
+                                }
+                                recordListeningEvent(track, completed = false, skipped = false)
                                 
                                 // Reset Last.fm triggers and Notify Now Playing
                                 hasScrobbledCurrent = false
                                 val settings = PlexSettingsManager(appContext)
                                 LastFmScrobbler.updateNowPlaying(appContext, settings, track)
                                 loadLyricsForTrack(track)
+                                persistPlaybackState(force = true)
                             }
                         }
                     }
@@ -300,7 +445,8 @@ class PlaybackManager private constructor(private val appContext: Context) {
                     artist = track.artist,
                     album = track.album,
                     key = track.key,
-                    thumb = track.thumb
+                    thumb = track.thumb,
+                    albumArtist = track.albumArtist.orEmpty()
                 )
             )
         }
@@ -312,17 +458,25 @@ class PlaybackManager private constructor(private val appContext: Context) {
 
         mainHandler.post {
             exoPlayer?.let { player ->
+                val mediaItems = buildMediaItems(queueList, normalizedBaseUrl, retryableOnFailure = true)
+                if (mediaItems == null) {
+                    player.stop()
+                    player.clearMediaItems()
+                    visualizerCapture.setEnabled(false, clearFrameWhenDisabled = true)
+                    _isPlaying.value = false
+                    _isLoading.value = false
+                    return@let
+                }
+                _playbackError.value = null
+                _playbackErrorRetryable.value = false
+                _playbackErrorOfflineTrackMissing.value = false
+                _playbackErrorDiagnostic.value = null
+                _currentTrack.value?.let { finalizeCompanionPlayEvent(it) }
+                visualizerCapture.setEnabled(false, clearFrameWhenDisabled = true)
                 player.stop()
                 player.clearMediaItems()
-                val mediaItems = queueList.map { track ->
-                    val streamUrl = mediaUri(track, normalizedBaseUrl)
-                    MediaItem.Builder()
-                        .setUri(streamUrl)
-                        .setMediaId(track.ratingKey)
-                        .build()
-                }
                 player.addMediaItems(mediaItems)
-                player.shuffleModeEnabled = _shuffleModeEnabled.value
+                player.shuffleModeEnabled = false // Manual shuffle handled by queue order
                 player.repeatMode = _repeatMode.value
                 if (startIndex in mediaItems.indices) {
                     player.seekTo(startIndex, 0L)
@@ -331,11 +485,39 @@ class PlaybackManager private constructor(private val appContext: Context) {
                 player.playWhenReady = true
                 _isPlaying.value = true
                 applyAudioEffects()
+                persistPlaybackState(force = true)
             }
         }
     }
 
-    private fun recordListeningEvent(track: TrackItem, completed: Boolean, skipped: Boolean, playEventId: String? = null) {
+    private fun updateExoPlayerQueueOrder(queueList: List<TrackItem>) {
+        val desiredMediaIds = queueList.map { it.ratingKey }
+        mainHandler.post {
+            val player = exoPlayer ?: return@post
+            if (player.mediaItemCount != desiredMediaIds.size) return@post
+
+            val currentMediaIds = (0 until player.mediaItemCount).map { index ->
+                player.getMediaItemAt(index).mediaId
+            }
+            if (currentMediaIds.groupingBy { it }.eachCount() != desiredMediaIds.groupingBy { it }.eachCount()) {
+                return@post
+            }
+
+            for (targetIndex in desiredMediaIds.indices) {
+                val mediaId = desiredMediaIds[targetIndex]
+                var sourceIndex = targetIndex
+                while (sourceIndex < player.mediaItemCount && player.getMediaItemAt(sourceIndex).mediaId != mediaId) {
+                    sourceIndex++
+                }
+                if (sourceIndex == player.mediaItemCount) return@post
+                if (sourceIndex != targetIndex) {
+                    player.moveMediaItem(sourceIndex, targetIndex)
+                }
+            }
+        }
+    }
+
+    private fun recordListeningEvent(track: TrackItem, completed: Boolean, skipped: Boolean) {
         coroutineScope.launch {
             historyMutex.withLock {
                 val dao = musicDao ?: return@withLock
@@ -355,18 +537,34 @@ class PlaybackManager private constructor(private val appContext: Context) {
                         lastSkippedAt = if (skipped) now else existing?.lastSkippedAt
                     )
                 )
-                if (!completed && !skipped) {
-                    track.spotCoreTrackId()?.let { trackId ->
-                        dao.insertPendingCompanionPlay(
-                            PendingCompanionPlayEntity(
-                                eventId = playEventId ?: UUID.randomUUID().toString(),
-                                trackId = trackId,
-                                playedAt = now
-                            )
-                        )
-                        CompanionPlaySyncScheduler.enqueue(appContext)
-                    }
-                }
+            }
+        }
+    }
+
+    private fun finalizeCompanionPlayEvent(track: TrackItem) {
+        val eventId = currentPlayEventId ?: return
+        if (companionEventQueued) return
+        companionEventQueued = true
+        val playedAt = currentPlayStartedAt
+        val listenedMs = listeningDuration.totalMs
+        coroutineScope.launch {
+            val dao = musicDao ?: return@launch
+            val settings = PlexSettingsManager(appContext)
+            val accountIdentity = SyncAccountIsolationPolicy.identity(
+                settings.companionBackendUrl,
+                settings.companionDeviceId
+            )?.let { "${it.backendOrigin}|${it.accountId}" } ?: return@launch
+            track.spotCoreTrackId()?.let { trackId ->
+                dao.insertPendingCompanionPlay(
+                    PendingCompanionPlayEntity(
+                        eventId = eventId,
+                        trackId = trackId,
+                        playedAt = playedAt,
+                        accountIdentity = accountIdentity,
+                        listenedMs = listenedMs
+                    )
+                )
+                CompanionPlaySyncScheduler.enqueue(appContext)
             }
         }
     }
@@ -390,42 +588,109 @@ class PlaybackManager private constructor(private val appContext: Context) {
         return null
     }
 
-    private fun mediaUri(track: TrackItem, normalizedBaseUrl: String = baseUrl.trimEnd('/')): String {
+    internal fun mediaUri(track: TrackItem, normalizedBaseUrl: String = baseUrl.trimEnd('/') ): String {
         val localFile = getLocalAudioFile(track)
-        if (localFile != null) return localFile.toURI().toString()
-        return if (track.key.startsWith("http://") || track.key.startsWith("https://")) {
-            track.key
-        } else {
-            "$normalizedBaseUrl${track.key}"
+        val pairedCompanionUrl = PlexSettingsManager(appContext).companionBackendUrl
+        val mediaBaseUrl = if (track.spotCoreTrackId() != null && pairedCompanionUrl.isNotBlank()) pairedCompanionUrl else normalizedBaseUrl
+        val remoteUri = resolveCompanionMediaReference(mediaBaseUrl, track.key)
+        return PlaybackUriPolicy.resolve(
+            localUri = localFile?.toURI()?.toString(),
+            remoteUri = remoteUri,
+            offlineOnly = PlexSettingsManager(appContext).offlineOnly
+        ) ?: throw OfflineTrackUnavailableException()
+    }
+
+    private fun buildMediaItems(
+        tracks: List<TrackItem>,
+        normalizedBaseUrl: String,
+        retryableOnFailure: Boolean
+    ): List<MediaItem>? = try {
+        tracks.map { track ->
+            MediaItem.Builder()
+                .setUri(mediaUri(track, normalizedBaseUrl))
+                .setMediaId(track.ratingKey)
+                .build()
+        }.also {
+            _playbackError.value = null
+            _playbackErrorRetryable.value = false
+            _playbackErrorOfflineTrackMissing.value = false
+            _playbackErrorDiagnostic.value = null
         }
+    } catch (error: OfflineTrackUnavailableException) {
+        _playbackError.value = appContext.getString(R.string.playback_offline_track_missing)
+        _playbackErrorRetryable.value = retryableOnFailure
+        _playbackErrorOfflineTrackMissing.value = true
+        _playbackErrorDiagnostic.value = null
+        null
+    } catch (error: Exception) {
+        android.util.Log.w("PlaybackManager", "Could not prepare playback queue (${error::class.simpleName})")
+        _playbackError.value = appContext.getString(R.string.playback_error_generic)
+        _playbackErrorRetryable.value = retryableOnFailure
+        _playbackErrorOfflineTrackMissing.value = false
+        _playbackErrorDiagnostic.value = null
+        null
+    }
+
+    fun clearPlaybackError() {
+        _playbackError.value = null
+        _playbackErrorRetryable.value = false
+        _playbackErrorOfflineTrackMissing.value = false
+        _playbackErrorDiagnostic.value = null
     }
 
     fun playTrack(track: TrackItem, queueList: List<TrackItem>) {
-        _queue.value = queueList
-        val index = queueList.indexOfFirst { it.ratingKey == track.ratingKey }
-        _currentIndex.value = if (index != -1) index else 0
-        _currentTrack.value = track
-        persistPlaybackState()
-        updateExoPlayerQueue(queueList, if (index != -1) index else 0)
+        originalQueue = queueList
+        if (_shuffleModeEnabled.value) {
+            val shuffled = queueList.filter { it.ratingKey != track.ratingKey }.shuffled()
+            val newQueue = listOf(track) + shuffled
+            _queue.value = newQueue
+            _currentIndex.value = 0
+            _currentTrack.value = track
+            updateExoPlayerQueue(newQueue, 0)
+        } else {
+            _queue.value = queueList
+            val index = queueList.indexOfFirst { it.ratingKey == track.ratingKey }
+            _currentIndex.value = if (index != -1) index else 0
+            _currentTrack.value = track
+            updateExoPlayerQueue(queueList, if (index != -1) index else 0)
+        }
+        persistPlaybackState(force = true)
     }
 
     fun playQueue(queueList: List<TrackItem>, startIndex: Int = 0) {
         if (queueList.isEmpty()) return
-        _queue.value = queueList
+        originalQueue = queueList
         val index = if (startIndex in queueList.indices) startIndex else 0
-        _currentIndex.value = index
-        _currentTrack.value = queueList[index]
-        persistPlaybackState()
-        updateExoPlayerQueue(queueList, index)
+        val track = queueList[index]
+        
+        if (_shuffleModeEnabled.value) {
+            val shuffled = queueList.filter { it.ratingKey != track.ratingKey }.shuffled()
+            val newQueue = listOf(track) + shuffled
+            _queue.value = newQueue
+            _currentIndex.value = 0
+            _currentTrack.value = track
+            updateExoPlayerQueue(newQueue, 0)
+        } else {
+            _queue.value = queueList
+            _currentIndex.value = index
+            _currentTrack.value = track
+            updateExoPlayerQueue(queueList, index)
+        }
+        persistPlaybackState(force = true)
     }
 
     fun playNext(track: TrackItem) {
+        if (_currentTrack.value?.ratingKey == track.ratingKey) return
+        val normalizedBaseUrl = baseUrl.trimEnd('/')
+        val mediaItem = buildMediaItems(listOf(track), normalizedBaseUrl, retryableOnFailure = false)
+            ?.singleOrNull() ?: return
         val currentQueue = _queue.value.toMutableList()
-        val currentIndexVal = _currentIndex.value
+        var currentIndexVal = _currentIndex.value
 
         val existingIndex = currentQueue.indexOfFirst { it.ratingKey == track.ratingKey }
         if (existingIndex != -1) {
             currentQueue.removeAt(existingIndex)
+            if (existingIndex < currentIndexVal) currentIndexVal--
             mainHandler.post {
                 exoPlayer?.removeMediaItem(existingIndex)
             }
@@ -434,134 +699,229 @@ class PlaybackManager private constructor(private val appContext: Context) {
         val insertIndex = if (currentIndexVal == -1) 0 else currentIndexVal + 1
         currentQueue.add(insertIndex, track)
         _queue.value = currentQueue
+        _currentIndex.value = currentIndexVal.coerceAtLeast(0)
+        if (currentIndexVal == -1) {
+            _currentTrack.value = track
+            _isPlaying.value = true
+        }
 
         mainHandler.post {
-            val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-            val streamUrl = mediaUri(track, normalizedBaseUrl)
-            val mediaItem = MediaItem.Builder()
-                .setUri(streamUrl)
-                .setMediaId(track.ratingKey)
-                .build()
             exoPlayer?.addMediaItem(insertIndex, mediaItem)
             if (currentIndexVal == -1) {
-                _currentIndex.value = 0
-                _currentTrack.value = track
                 exoPlayer?.prepare()
                 exoPlayer?.playWhenReady = true
             }
         }
+        originalQueue = _queue.value
+        persistPlaybackState(force = true)
     }
 
     fun playTracksNext(tracks: List<TrackItem>) {
+        val normalizedBaseUrl = baseUrl.trimEnd('/')
+        val mediaItems = buildMediaItems(tracks, normalizedBaseUrl, retryableOnFailure = false) ?: return
         val currentQueue = _queue.value.toMutableList()
         val currentIndexVal = _currentIndex.value
 
         val insertIndex = if (currentIndexVal == -1) 0 else currentIndexVal + 1
         currentQueue.addAll(insertIndex, tracks)
         _queue.value = currentQueue
+        if (currentIndexVal == -1 && tracks.isNotEmpty()) {
+            _currentIndex.value = 0
+            _currentTrack.value = tracks.first()
+            _isPlaying.value = true
+        }
 
         mainHandler.post {
-            val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-            val mediaItems = tracks.map { track ->
-                val streamUrl = mediaUri(track, normalizedBaseUrl)
-                MediaItem.Builder()
-                    .setUri(streamUrl)
-                    .setMediaId(track.ratingKey)
-                    .build()
-            }
             exoPlayer?.addMediaItems(insertIndex, mediaItems)
             if (currentIndexVal == -1 && tracks.isNotEmpty()) {
-                _currentIndex.value = 0
-                _currentTrack.value = tracks.first()
                 exoPlayer?.prepare()
                 exoPlayer?.playWhenReady = true
             }
         }
+        originalQueue = _queue.value
+        persistPlaybackState(force = true)
     }
 
     fun addToQueue(track: TrackItem) {
         val currentQueue = _queue.value.toMutableList()
         if (currentQueue.any { it.ratingKey == track.ratingKey }) return
+        val mediaItem = buildMediaItems(listOf(track), baseUrl.trimEnd('/'), retryableOnFailure = false)
+            ?.singleOrNull() ?: return
         currentQueue.add(track)
         _queue.value = currentQueue
+        val startsPlayback = _currentIndex.value == -1
+        if (startsPlayback) {
+            _currentIndex.value = 0
+            _currentTrack.value = track
+            _isPlaying.value = true
+        }
 
         mainHandler.post {
-            val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-            val streamUrl = mediaUri(track, normalizedBaseUrl)
-            val mediaItem = MediaItem.Builder()
-                .setUri(streamUrl)
-                .setMediaId(track.ratingKey)
-                .build()
             exoPlayer?.addMediaItem(mediaItem)
-            if (_currentIndex.value == -1) {
-                _currentIndex.value = 0
-                _currentTrack.value = track
+            if (startsPlayback) {
                 exoPlayer?.prepare()
                 exoPlayer?.playWhenReady = true
             }
         }
+        originalQueue = _queue.value
+        persistPlaybackState(force = true)
     }
 
     fun addTracksToQueue(tracks: List<TrackItem>) {
+        val mediaItems = buildMediaItems(tracks, baseUrl.trimEnd('/'), retryableOnFailure = false) ?: return
         val currentQueue = _queue.value.toMutableList()
         currentQueue.addAll(tracks)
         _queue.value = currentQueue
+        val startsPlayback = _currentIndex.value == -1 && tracks.isNotEmpty()
+        if (startsPlayback) {
+            _currentIndex.value = 0
+            _currentTrack.value = tracks.first()
+            _isPlaying.value = true
+        }
 
         mainHandler.post {
-            val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
-            val mediaItems = tracks.map { track ->
-                val streamUrl = mediaUri(track, normalizedBaseUrl)
-                MediaItem.Builder()
-                    .setUri(streamUrl)
-                    .setMediaId(track.ratingKey)
-                    .build()
-            }
             exoPlayer?.addMediaItems(mediaItems)
-            if (_currentIndex.value == -1 && tracks.isNotEmpty()) {
-                _currentIndex.value = 0
-                _currentTrack.value = tracks.first()
+            if (startsPlayback) {
                 exoPlayer?.prepare()
                 exoPlayer?.playWhenReady = true
             }
         }
+        originalQueue = _queue.value
+        persistPlaybackState(force = true)
     }
 
     fun removeFromQueue(index: Int) {
         if (index !in _queue.value.indices) return
+        val oldCurrentIndex = _currentIndex.value
+        val wasCurrent = index == oldCurrentIndex
+        if (wasCurrent) _currentTrack.value?.let { finalizeCompanionPlayEvent(it) }
         val updated = _queue.value.toMutableList().apply { removeAt(index) }
         _queue.value = updated
         mainHandler.post { exoPlayer?.removeMediaItem(index) }
         if (updated.isEmpty()) {
             _currentIndex.value = -1
             _currentTrack.value = null
-        } else if (_currentIndex.value >= updated.size) {
-            _currentIndex.value = updated.lastIndex
-            _currentTrack.value = updated.last()
+            _isPlaying.value = false
+            visualizerCapture.setEnabled(false, clearFrameWhenDisabled = true)
+        } else if (wasCurrent) {
+            _currentIndex.value = index.coerceAtMost(updated.lastIndex)
+            _currentTrack.value = updated[_currentIndex.value]
+            mainHandler.post {
+                exoPlayer?.let { player ->
+                    player.seekTo(_currentIndex.value, 0L)
+                }
+            }
+        } else {
+            val nextIndex = if (index < oldCurrentIndex) oldCurrentIndex - 1 else oldCurrentIndex
+            _currentIndex.value = nextIndex.takeIf { it in updated.indices } ?: updated.lastIndex
+            _currentTrack.value = updated[_currentIndex.value]
         }
-        persistPlaybackState()
+        originalQueue = updated
+        persistPlaybackState(force = true)
+    }
+
+    fun moveQueueItem(from: Int, to: Int) {
+        if (from !in _queue.value.indices || to !in _queue.value.indices || from == to) return
+        val updated = _queue.value.toMutableList().apply { add(to, removeAt(from)) }
+        val current = _currentIndex.value
+        _currentIndex.value = when {
+            current == from -> to
+            from < current && to >= current -> current - 1
+            from > current && to <= current -> current + 1
+            else -> current
+        }
+        _queue.value = updated
+        mainHandler.post { exoPlayer?.moveMediaItem(from, to) }
+        _currentTrack.value = updated.getOrNull(_currentIndex.value)
+        originalQueue = updated
+        persistPlaybackState(force = true)
+    }
+
+    /** Replaces only the observable queue state for debug/QA fixtures; no media URI is loaded. */
+    fun replaceQueueForQa(tracks: List<TrackItem>, currentIndex: Int = 0) {
+        val selectedIndex = if (tracks.isEmpty()) -1 else currentIndex.takeIf { it in tracks.indices } ?: 0
+        mainHandler.post {
+            stopProgressUpdates()
+            _currentTrack.value?.let { finalizeCompanionPlayEvent(it) }
+            exoPlayer?.stop()
+            exoPlayer?.clearMediaItems()
+        }
+        visualizerCapture.setEnabled(false, clearFrameWhenDisabled = true)
+        originalQueue = tracks
+        _queue.value = tracks
+        _currentIndex.value = selectedIndex
+        _currentTrack.value = tracks.getOrNull(selectedIndex)
+        _isPlaying.value = false
+        _isLoading.value = false
+        _progress.value = 0L
+        persistPlaybackState(force = true)
     }
 
     fun clearQueue() {
         mainHandler.post {
+            _currentTrack.value?.let { finalizeCompanionPlayEvent(it) }
             exoPlayer?.stop()
             exoPlayer?.clearMediaItems()
         }
+        visualizerCapture.setEnabled(false, clearFrameWhenDisabled = true)
         _queue.value = emptyList()
         _currentIndex.value = -1
         _currentTrack.value = null
+        _isPlaying.value = false
         _progress.value = 0L
-        persistPlaybackState()
+        persistPlaybackState(force = true)
+    }
+
+    fun clearUpcoming() {
+        val currentQueue = _queue.value
+        val activeTrack = _currentTrack.value
+        val currentIndex = _currentIndex.value.takeIf { index ->
+            index in currentQueue.indices && currentQueue[index].ratingKey == activeTrack?.ratingKey
+        } ?: currentQueue.indexOfFirst { it.ratingKey == activeTrack?.ratingKey }
+        val retainedQueue = PlaybackQueuePresentation.keepCurrentAndEarlier(currentQueue, currentIndex)
+
+        if (retainedQueue.isEmpty()) {
+            clearQueue()
+            return
+        }
+        if (retainedQueue.size == currentQueue.size) return
+
+        _queue.value = retainedQueue
+        originalQueue = retainedQueue
+        mainHandler.post {
+            exoPlayer?.let { player ->
+                val firstRemovedIndex = retainedQueue.size
+                if (player.mediaItemCount > firstRemovedIndex) {
+                    player.removeMediaItems(firstRemovedIndex, player.mediaItemCount)
+                }
+            }
+        }
+        persistPlaybackState(force = true)
     }
 
     fun play() {
         mainHandler.post {
+            if (_playbackError.value != null && _playbackErrorRetryable.value && _queue.value.isNotEmpty()) {
+                updateExoPlayerQueue(_queue.value, _currentIndex.value.coerceAtLeast(0))
+                return@post
+            }
+            clearPlaybackError()
             exoPlayer?.play()
+            // Publish command intent immediately; the listener still reconciles
+            // state changes caused by buffering, focus loss, or completion.
+            _isPlaying.value = true
+            persistPlaybackState(force = true)
         }
     }
 
     fun pause() {
         mainHandler.post {
             exoPlayer?.pause()
+            // Do not leave callers observing a stale playing state while waiting
+            // for Media3 to deliver its asynchronous callback.
+            _isPlaying.value = false
+            updateVisualizerCaptureForPlayback(isPlaying = false)
+            persistPlaybackState(force = true)
         }
     }
 
@@ -601,16 +961,74 @@ class PlaybackManager private constructor(private val appContext: Context) {
         mainHandler.post {
             exoPlayer?.seekTo(positionMs)
             _progress.value = positionMs
-            persistPlaybackState()
+            persistPlaybackState(force = true)
         }
     }
 
     fun toggleShuffle() {
         val newValue = !_shuffleModeEnabled.value
         _shuffleModeEnabled.value = newValue
-        persistPlaybackState()
-        mainHandler.post {
-            exoPlayer?.shuffleModeEnabled = newValue
+
+        val current = _currentTrack.value
+        if (newValue && current != null) {
+            // Keep the active queue entry and shuffle every other entry, including duplicate tracks.
+            val queue = _queue.value
+            val currentIndex = _currentIndex.value
+                .takeIf { it in queue.indices && queue[it].ratingKey == current.ratingKey }
+                ?: queue.indexOfFirst { it.ratingKey == current.ratingKey }
+            val currentQueueTrack = queue.getOrNull(currentIndex) ?: current
+            val remaining = queue.toMutableList().apply {
+                if (currentIndex in indices) removeAt(currentIndex)
+            }.shuffled()
+            val newQueue = listOf(currentQueueTrack) + remaining
+            _queue.value = newQueue
+            _currentIndex.value = 0
+            updateExoPlayerQueueOrder(newQueue)
+        } else if (!newValue && originalQueue.isNotEmpty()) {
+            // Restore original order
+            val newIndex = originalQueue.indexOfFirst { it.ratingKey == current?.ratingKey }
+            _queue.value = originalQueue
+            _currentIndex.value = if (newIndex != -1) newIndex else 0
+            updateExoPlayerQueueOrder(originalQueue)
+        }
+
+        persistPlaybackState(force = true)
+    }
+
+    /** Sets a deterministic playback failure for Compose QA without starting network playback. */
+    fun setPlaybackErrorForQa(message: String, retryable: Boolean) {
+        _playbackError.value = message
+        _playbackErrorRetryable.value = retryable
+        _playbackErrorOfflineTrackMissing.value = false
+        _playbackErrorDiagnostic.value = null
+        _isPlaying.value = false
+        _isLoading.value = false
+        visualizerCapture.setEnabled(false, clearFrameWhenDisabled = true)
+    }
+
+    /** Sets a safe, stable Media3 error identifier for deterministic Compose QA. */
+    fun setPlaybackDiagnosticForQa(code: String) {
+        _playbackErrorDiagnostic.value = code
+    }
+
+    /**
+     * QA-only state stress helper. Fixture controls intentionally do not reload
+     * Media3 for every toggle; real queue/player transitions are covered by the
+     * dedicated playback instrumentation tests.
+     */
+    fun toggleShuffleForQa() {
+        val newValue = !_shuffleModeEnabled.value
+        _shuffleModeEnabled.value = newValue
+
+        val current = _currentTrack.value
+        if (newValue && current != null) {
+            val remaining = _queue.value.filter { it.ratingKey != current.ratingKey }.shuffled()
+            _queue.value = listOf(current) + remaining
+            _currentIndex.value = 0
+        } else if (!newValue && originalQueue.isNotEmpty()) {
+            val newIndex = originalQueue.indexOfFirst { it.ratingKey == current?.ratingKey }
+            _queue.value = originalQueue
+            _currentIndex.value = if (newIndex != -1) newIndex else 0
         }
     }
 
@@ -621,7 +1039,7 @@ class PlaybackManager private constructor(private val appContext: Context) {
             else -> Player.REPEAT_MODE_OFF
         }
         _repeatMode.value = nextMode
-        persistPlaybackState()
+        persistPlaybackState(force = true)
         mainHandler.post {
             exoPlayer?.repeatMode = nextMode
         }
@@ -645,18 +1063,21 @@ class PlaybackManager private constructor(private val appContext: Context) {
     private val progressRunnable = object : Runnable {
         override fun run() {
             exoPlayer?.let { player ->
-                    if (player.isPlaying) {
+                if (player.isPlaying) {
+                    listeningDuration.sample(android.os.SystemClock.elapsedRealtime(), isPlaying = true)
                     val pos = player.currentPosition
                     _progress.value = pos
                     persistPlaybackState()
-                        _currentTrack.value?.let { track ->
-                            checkScrobbleProgress(pos, player.duration, track)
-                            val completionThreshold = if (player.duration > 30_000L) player.duration - 30_000L else (player.duration * 0.9).toLong()
-                            if (!currentTrackCompleted && completionThreshold > 0 && pos >= completionThreshold) {
-                                currentTrackCompleted = true
-                                recordListeningEvent(track, completed = true, skipped = false)
-                            }
+                    _currentTrack.value?.let { track ->
+                        checkScrobbleProgress(pos, player.duration, track)
+                        val completionThreshold = if (player.duration > 30_000L) player.duration - 30_000L else (player.duration * 0.9).toLong()
+                        if (!currentTrackCompleted && completionThreshold > 0 && pos >= completionThreshold) {
+                            currentTrackCompleted = true
+                            recordListeningEvent(track, completed = true, skipped = false)
                         }
+                    }
+                } else {
+                    listeningDuration.sample(android.os.SystemClock.elapsedRealtime(), isPlaying = false)
                 }
             }
             mainHandler.postDelayed(this, 250)
@@ -675,6 +1096,23 @@ class PlaybackManager private constructor(private val appContext: Context) {
     fun refreshAudioSettings() {
         mainHandler.post {
             applyAudioEffects()
+        }
+    }
+
+    fun setVisualizerCaptureEnabled(enabled: Boolean) {
+        visualizerPlaybackGate.setCaptureRequested(
+            enabled = enabled,
+            isPlaying = exoPlayer?.isPlaying == true
+        )
+    }
+
+    private fun updateVisualizerCaptureForPlayback(isPlaying: Boolean) {
+        visualizerPlaybackGate.onPlaybackChanged(isPlaying)
+    }
+
+    fun setGaplessPlaybackEnabled(enabled: Boolean) {
+        mainHandler.post {
+            exoPlayer?.setPauseAtEndOfMediaItems(!enabled)
         }
     }
 
@@ -776,6 +1214,7 @@ class PlaybackManager private constructor(private val appContext: Context) {
     }
 
     private var lyricsJob: Job? = null
+    private val lyricsRequestGate = LyricsRequestGate()
 
     private fun findFileCaseInsensitive(parentDir: File, baseNames: List<String>, extensions: List<String>): File? {
         if (!parentDir.exists() || !parentDir.isDirectory) return null
@@ -801,6 +1240,7 @@ class PlaybackManager private constructor(private val appContext: Context) {
     }
 
     fun loadLyricsForTrack(track: TrackItem?) {
+        val requestGeneration = lyricsRequestGate.begin()
         lyricsJob?.cancel()
         if (track == null) {
             _currentLyrics.value = null
@@ -810,12 +1250,40 @@ class PlaybackManager private constructor(private val appContext: Context) {
 
         _lyricsLoading.value = true
         lyricsJob = coroutineScope.launch(Dispatchers.IO) {
+            fun publish(lyrics: Lyrics?) {
+                if (lyricsRequestGate.isCurrent(requestGeneration)) _currentLyrics.value = lyrics
+            }
             try {
                 var lyricsLoaded = false
 
-                // 1. Try to fetch lyrics from Plex Server if online/streaming
-                val trackUsesCompanionStream = track.key.startsWith("http://") || track.key.startsWith("https://")
-                if (!trackUsesCompanionStream && baseUrl.isNotEmpty() && token.isNotEmpty() && track.ratingKey.isNotEmpty()) {
+                // 1. Try to fetch lyrics from Companion Server if online/streaming
+                val settings = PlexSettingsManager(appContext)
+                val trackUsesCompanionStream = isExactCompanionOrigin(track.key, settings.companionBackendUrl)
+                if (track.ratingKey.startsWith("companion:") || trackUsesCompanionStream) {
+                    try {
+                        val trackId = if (track.ratingKey.startsWith("companion:")) {
+                            track.ratingKey.removePrefix("companion:")
+                        } else {
+                            // Extract ID from stream URL if possible, or use ratingKey as is
+                            track.ratingKey
+                        }
+                        
+                        val response = com.example.data.BackendClientManager
+                            .getApiService(settings.companionBackendUrl)
+                            .getLyrics(trackId, "Bearer ${settings.companionBackendToken}")
+                        
+                        if (response.text.isNotBlank()) {
+                            publish(LyricsParser.parse(response.text, response.synced))
+                            lyricsLoaded = true
+                            android.util.Log.d("PlaybackManager", "Successfully fetched lyrics from SpotCore")
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.d("PlaybackManager", "SpotCore lyrics request failed (${e::class.simpleName})")
+                    }
+                }
+                
+                // 2. Fallback to Plex Server if not loaded and not companion exclusive
+                if (!lyricsLoaded && !trackUsesCompanionStream && baseUrl.isNotEmpty() && token.isNotEmpty() && track.ratingKey.isNotEmpty()) {
                     try {
                         val apiService = com.example.data.PlexClientManager.getApiService(baseUrl)
                         val detail = apiService.getMetadataDetail(track.ratingKey, token)
@@ -828,17 +1296,19 @@ class PlaybackManager private constructor(private val appContext: Context) {
                             val streamUrl = if (lyricStream.key.startsWith("http")) {
                                 lyricStream.key
                             } else {
-                                "${baseUrl.trimEnd('/')}${lyricStream.key}?X-Plex-Token=$token"
+                                "${baseUrl.trimEnd('/')}${lyricStream.key}"
                             }
-                            
-                            val request = okhttp3.Request.Builder()
-                                .url(streamUrl)
-                                .get()
-                                .build()
+
+                            val requestBuilder = okhttp3.Request.Builder().url(streamUrl).get()
+                            if (isExactOrigin(streamUrl, baseUrl) && token.isNotBlank()) {
+                                requestBuilder.header("X-Plex-Token", token)
+                            }
+                            val request = requestBuilder.build()
                             
                             val client = okhttp3.OkHttpClient.Builder()
                                 .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
                                 .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+                                .addInterceptor(com.example.data.QaNetworkInterceptor())
                                 .build()
                                 
                             client.newCall(request).execute().use { response ->
@@ -848,15 +1318,15 @@ class PlaybackManager private constructor(private val appContext: Context) {
                                         val codec = lyricStream.codec?.lowercase() ?: lyricStream.format?.lowercase() ?: "lrc"
                                         val isLrc = codec == "lrc"
                                         val lyrics = LyricsParser.parse(content, isLrc)
-                                        _currentLyrics.value = lyrics
+                                        publish(lyrics)
                                         lyricsLoaded = true
-                                        android.util.Log.d("PlaybackManager", "Successfully fetched lyrics from Plex Server for track ${track.title}")
+                                        android.util.Log.d("PlaybackManager", "Successfully fetched lyrics from configured music service")
                                     }
                                 }
                             }
                         }
                     } catch (e: Exception) {
-                        android.util.Log.e("PlaybackManager", "Error fetching lyrics from Plex Server", e)
+                        android.util.Log.e("PlaybackManager", "Configured music service lyrics request failed (${e::class.simpleName})")
                     }
                 }
 
@@ -924,28 +1394,40 @@ class PlaybackManager private constructor(private val appContext: Context) {
                         val isLrc = selectedFile.extension.lowercase() == "lrc"
                         val content = selectedFile.readText(Charsets.UTF_8)
                         val lyrics = LyricsParser.parse(content, isLrc)
-                        _currentLyrics.value = lyrics
+                        publish(lyrics)
                     } else {
-                        _currentLyrics.value = null
+                        publish(null)
                     }
                 }
             } catch (e: Exception) {
-                android.util.Log.e("PlaybackManager", "Error loading lyrics for ${track.title}", e)
-                _currentLyrics.value = null
+                android.util.Log.e("PlaybackManager", "Could not load lyrics (${e::class.simpleName})")
+                publish(null)
             } finally {
-                _lyricsLoading.value = false
+                if (lyricsRequestGate.isCurrent(requestGeneration)) _lyricsLoading.value = false
             }
         }
     }
 
     fun release() {
+        visualizerPlaybackGate.setCaptureRequested(enabled = false, isPlaying = false)
         mainHandler.post {
             stopProgressUpdates()
             equalizer?.release()
             dynamicsProcessing?.release()
-            exoPlayer?.release()
+            try {
+                exoPlayer?.release()
+            } catch (error: IllegalArgumentException) {
+                // Media3 may attempt to unregister the noisy-audio receiver
+                // during teardown even when playback never registered it.
+                android.util.Log.w("PlaybackManager", "Player receiver was already unregistered during release", error)
+            }
             exoPlayer = null
         }
         coroutineScope.cancel()
+        // A released manager cannot be reused: the scope is cancelled and the player is gone.
+        // Clear the singleton so a later activity/service/test obtains a fresh instance.
+        synchronized(PlaybackManager::class.java) {
+            if (INSTANCE === this) INSTANCE = null
+        }
     }
 }

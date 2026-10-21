@@ -16,3 +16,12 @@
 local.properties
 .env
 debug.keystore
+
+qa-fixtures/audio/
+
+/qa-results/
+/app/qa-results/
+
+# JVM crash/replay diagnostics are machine-local residue; QA reports belong under qa-results/.
+hs_err_pid*.log
+replay_pid*.log

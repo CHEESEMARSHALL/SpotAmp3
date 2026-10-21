@@ -14,6 +14,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.QueueMusic
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
@@ -26,18 +27,28 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.progressBarRangeInfo
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import java.util.Locale
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.Player
 import coil.compose.AsyncImage
 
+import com.example.playback.PlaybackControlAvailability
 import com.example.playback.PlaybackManager
 import com.example.playback.TrackItem
-import com.example.data.LocalDjBlurbService
+import com.example.R
+import kotlin.math.abs
 
 @Composable
 fun LegacyNowPlayingScreen(
@@ -50,6 +61,7 @@ fun LegacyNowPlayingScreen(
     modifier: Modifier = Modifier
 ) {
     val playbackManager = viewModel.playbackManager
+    val visualizerFrame by playbackManager.visualizerFrame.collectAsStateWithLifecycle()
     val currentTrack by playbackManager.currentTrack.collectAsStateWithLifecycle()
     val queue by playbackManager.queue.collectAsStateWithLifecycle()
     val currentIndex by playbackManager.currentIndex.collectAsStateWithLifecycle()
@@ -62,7 +74,7 @@ fun LegacyNowPlayingScreen(
     val lyrics by playbackManager.currentLyrics.collectAsStateWithLifecycle()
     val lyricsLoading by playbackManager.lyricsLoading.collectAsStateWithLifecycle()
 
-    var showQueue by remember { mutableStateOf(false) }
+    var showQueue by remember { mutableStateOf(value = false) }
     var showContextMenu by remember { mutableStateOf(false) }
     var showLyrics by remember { mutableStateOf(false) }
 
@@ -71,16 +83,22 @@ fun LegacyNowPlayingScreen(
         if (it.thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, it.thumb) else null
     }
 
-    val spectrum = remember { FloatArray(48) }
-    val waveform = remember { FloatArray(128) }
     var visualizerMode by remember { mutableStateOf(PlaybackArtworkMode.ARTWORK) }
+    LaunchedEffect(visualizerMode, showLyrics, showQueue) {
+        playbackManager.setVisualizerCaptureEnabled(
+            enabled = !showQueue && !showLyrics && visualizerMode != PlaybackArtworkMode.ARTWORK
+        )
+    }
+    DisposableEffect(playbackManager) {
+        onDispose { playbackManager.setVisualizerCaptureEnabled(false) }
+    }
 
     Box(
         modifier = modifier
             .fillMaxSize()
             .background(Color(0xFF080808))
             .pointerInput(Unit) {
-                detectVerticalDragGestures { change, dragAmount ->
+                detectVerticalDragGestures { _, dragAmount ->
                     if (dragAmount > 50) { // Simple threshold for swipe down
                         onCollapse()
                     }
@@ -139,7 +157,7 @@ fun LegacyNowPlayingScreen(
                 ) {
                     Icon(
                         imageVector = Icons.Rounded.KeyboardArrowDown,
-                        contentDescription = "Collapse Player",
+                        contentDescription = stringResource(R.string.player_collapse_accessibility),
                         tint = Color.White,
                         modifier = Modifier.size(32.dp)
                     )
@@ -159,8 +177,11 @@ fun LegacyNowPlayingScreen(
                     modifier = Modifier.testTag("queue_toggle_button")
                 ) {
                     Icon(
-                        imageVector = if (showQueue) Icons.Rounded.MusicNote else Icons.Rounded.QueueMusic,
-                        contentDescription = "Show Queue",
+                        imageVector = if (showQueue) Icons.Rounded.MusicNote else Icons.AutoMirrored.Rounded.QueueMusic,
+                        contentDescription = stringResource(
+                            if (showQueue) R.string.player_back_to_player_accessibility
+                            else R.string.player_view_queue_accessibility
+                        ),
                         tint = if (showQueue) Color(0xFF818CF8) else Color.White
                     )
                 }
@@ -193,8 +214,8 @@ fun LegacyNowPlayingScreen(
                     } else {
                         PlaybackVisualSurface(
                             artworkUrl = imageUrl,
-                            spectrum = spectrum,
-                            waveform = waveform,
+                            spectrum = visualizerFrame.spectrum,
+                            waveform = visualizerFrame.waveform,
                             mode = visualizerMode,
                             token = token,
                             onModeChange = { visualizerMode = it },
@@ -202,6 +223,7 @@ fun LegacyNowPlayingScreen(
                                 showLyrics = true
                                 playbackManager.loadLyricsForTrack(currentTrack)
                             },
+                            onClickLabel = stringResource(R.string.player_show_lyrics),
                             modifier = Modifier
                                 .aspectRatio(1f)
                                 .fillMaxWidth(0.85f)
@@ -234,7 +256,7 @@ fun LegacyNowPlayingScreen(
 
                             currentTrack?.let { track ->
                                 Text(
-                                    text = track.artist,
+                                    text = localizedArtistPresentation(track.artist),
                                     style = MaterialTheme.typography.titleMedium.copy(
                                         color = Color(0xFF818CF8),
                                         fontWeight = FontWeight.Medium
@@ -243,14 +265,14 @@ fun LegacyNowPlayingScreen(
                                     overflow = TextOverflow.Ellipsis,
                                     modifier = Modifier.clickable {
                                         onCollapse()
-                                        onNavigateToArtist(track.ratingKey, track.artist)
+                                        onNavigateToArtist(track.artistRatingKey ?: track.ratingKey, track.artist)
                                     }
                                 )
 
                                 Spacer(modifier = Modifier.height(4.dp))
 
                                 Text(
-                                    text = track.album,
+                                    text = localizedAlbumPresentation(track.album),
                                     style = MaterialTheme.typography.bodyMedium.copy(
                                         color = Color.White.copy(alpha = 0.6f)
                                     ),
@@ -262,19 +284,9 @@ fun LegacyNowPlayingScreen(
                                     }
                                 )
 
-                                Text(
-                                    text = "Local DJ • ${LocalDjBlurbService().describe(track, currentIndex, queue.size)}",
-                                    style = MaterialTheme.typography.bodySmall.copy(
-                                        color = Color.White.copy(alpha = 0.48f),
-                                        fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
-                                    ),
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.padding(top = 6.dp)
-                                )
                                 if (track.genres.isNotEmpty()) {
                                     Text(
-                                        text = "Plex style • ${track.genres.joinToString(" • ")}",
+                                        text = "Genres • ${track.genres.joinToString(" • ")}",
                                         style = MaterialTheme.typography.labelSmall.copy(
                                             color = Color(0xFF67E8F9)
                                         ),
@@ -285,7 +297,7 @@ fun LegacyNowPlayingScreen(
                                 }
                             } ?: run {
                                 Text(
-                                    text = "Unknown Artist",
+                                    text = stringResource(R.string.common_unknown_artist),
                                     style = MaterialTheme.typography.titleMedium.copy(
                                         color = Color(0xFF818CF8),
                                         fontWeight = FontWeight.Medium
@@ -304,7 +316,7 @@ fun LegacyNowPlayingScreen(
                                 ) {
                                     Icon(
                                         imageVector = if (isLiked) Icons.Rounded.Favorite else Icons.Rounded.FavoriteBorder,
-                                        contentDescription = "Like Song",
+                                        contentDescription = trackLikeActionDescription(isLiked),
                                         tint = if (isLiked) Color.Red else Color.White
                                     )
                                 }
@@ -315,7 +327,7 @@ fun LegacyNowPlayingScreen(
                                 ) {
                                     Icon(
                                         imageVector = Icons.Rounded.MoreVert,
-                                        contentDescription = "Track Context Menu",
+                                        contentDescription = stringResource(R.string.player_track_options_accessibility, track.title),
                                         tint = Color.White
                                     )
                                 }
@@ -337,7 +349,7 @@ fun LegacyNowPlayingScreen(
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold, color = Color.White)
                         )
                         if (queue.isNotEmpty()) {
-                            TextButton(onClick = { playbackManager.clearQueue() }) { Text("Clear queue", color = Color(0xFFFCA5A5)) }
+                            TextButton(onClick = { playbackManager.clearQueue() }) { Text(stringResource(R.string.player_stop_clear_queue), color = Color(0xFFFCA5A5)) }
                         }
                     }
 
@@ -408,7 +420,7 @@ fun LegacyNowPlayingScreen(
                                         overflow = TextOverflow.Ellipsis
                                     )
                                     Text(
-                                        text = track.artist,
+                                        text = localizedArtistPresentation(track.artist),
                                         style = MaterialTheme.typography.bodyMedium.copy(
                                             color = Color.White.copy(alpha = 0.6f)
                                         ),
@@ -463,8 +475,9 @@ fun LegacyNowPlayingScreen(
                         text = displayPosition,
                         style = MaterialTheme.typography.bodySmall.copy(color = Color.White.copy(alpha = 0.6f))
                     )
-                    Text(
-                        text = "-${formatDuration(maxOf(0L, duration - currentPosition))}",
+                    RemainingDurationText(
+                        progressMs = currentPosition,
+                        durationMs = duration,
                         style = MaterialTheme.typography.bodySmall.copy(color = Color.White.copy(alpha = 0.6f))
                     )
                 }
@@ -484,7 +497,7 @@ fun LegacyNowPlayingScreen(
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.Shuffle,
-                            contentDescription = "Shuffle",
+                            contentDescription = stringResource(R.string.player_shuffle),
                             tint = if (shuffleMode) Color(0xFF818CF8) else Color.White.copy(alpha = 0.5f)
                         )
                     }
@@ -496,7 +509,7 @@ fun LegacyNowPlayingScreen(
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.SkipPrevious,
-                            contentDescription = "Previous Track",
+                            contentDescription = stringResource(R.string.player_previous_track),
                             tint = Color.White,
                             modifier = Modifier.size(36.dp)
                         )
@@ -525,7 +538,9 @@ fun LegacyNowPlayingScreen(
                         } else {
                             Icon(
                                 imageVector = if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
-                                contentDescription = if (isPlaying) "Pause" else "Play",
+                                contentDescription = stringResource(
+                                    if (isPlaying) R.string.player_pause_action else R.string.player_play_action
+                                ),
                                 tint = Color.White,
                                 modifier = Modifier.size(40.dp)
                             )
@@ -535,11 +550,16 @@ fun LegacyNowPlayingScreen(
                     // Next
                     IconButton(
                         onClick = { playbackManager.next() },
+                        enabled = PlaybackControlAvailability.canSkipToNext(
+                            queueSize = queue.size,
+                            currentIndex = currentIndex,
+                            repeatAll = repeatMode == Player.REPEAT_MODE_ALL
+                        ),
                         modifier = Modifier.testTag("next_button")
                     ) {
                         Icon(
                             imageVector = Icons.Rounded.SkipNext,
-                            contentDescription = "Next Track",
+                            contentDescription = stringResource(R.string.player_next_track),
                             tint = Color.White,
                             modifier = Modifier.size(36.dp)
                         )
@@ -556,7 +576,13 @@ fun LegacyNowPlayingScreen(
                                 Player.REPEAT_MODE_ALL -> Icons.Rounded.Repeat
                                 else -> Icons.Rounded.Repeat
                             },
-                            contentDescription = "Repeat",
+                            contentDescription = stringResource(
+                                when (repeatMode) {
+                                    Player.REPEAT_MODE_ONE -> R.string.player_repeat_one
+                                    Player.REPEAT_MODE_ALL -> R.string.player_repeat_all
+                                    else -> R.string.player_repeat_off
+                                }
+                            ),
                             tint = if (repeatMode != Player.REPEAT_MODE_OFF) Color(0xFF818CF8) else Color.White.copy(alpha = 0.5f)
                         )
                     }
@@ -575,7 +601,9 @@ fun LegacyNowPlayingScreen(
                     key = trackItem.key,
                     thumb = trackItem.thumb,
                     duration = trackItem.duration,
-                    albumRatingKey = trackItem.albumRatingKey
+                    albumRatingKey = trackItem.albumRatingKey,
+                    albumArtist = trackItem.albumArtist,
+                    artistRatingKey = trackItem.artistRatingKey
                 ),
                 viewModel = viewModel,
                 onDismiss = { showContextMenu = false },
@@ -596,10 +624,42 @@ fun LegacyNowPlayingScreen(
 
 // Utility to format millisecond durations (e.g. 195000 -> "3:15")
 fun formatDuration(ms: Long): String {
-    val totalSec = ms / 1000
+    val totalSec = ms.coerceAtLeast(0L) / 1000
     val min = totalSec / 60
     val sec = totalSec % 60
-    return String.format("%d:%02d", min, sec)
+    return String.format(Locale.ROOT, "%d:%02d", min, sec)
+}
+
+@Composable
+internal fun trackLikeActionDescription(isLiked: Boolean): String = stringResource(
+    if (isLiked) R.string.player_remove_liked_track else R.string.player_like_track
+)
+
+fun formatRemainingDuration(progressMs: Long, durationMs: Long): String {
+    if (durationMs <= 0L) return "--:--"
+    val boundedProgress = progressMs.coerceIn(0L, durationMs)
+    val remainingMs = durationMs - boundedProgress
+    return if (remainingMs < 1_000L) "0:00" else "-${formatDuration(remainingMs)}"
+}
+
+@Composable
+internal fun RemainingDurationText(
+    progressMs: Long,
+    durationMs: Long,
+    style: TextStyle,
+    modifier: Modifier = Modifier
+) {
+    val displayText = formatRemainingDuration(progressMs, durationMs)
+    val unknownDurationLabel = stringResource(R.string.player_duration_unknown)
+    Text(
+        text = displayText,
+        style = style,
+        modifier = if (durationMs <= 0L) {
+            modifier.semantics { contentDescription = unknownDurationLabel }
+        } else {
+            modifier
+        }
+    )
 }
 
 @Composable
@@ -616,7 +676,7 @@ fun WaveformDurationBar(
     val heights = remember(trackId) {
         val random = java.util.Random(trackId.hashCode().toLong())
         List(barsCount) { index ->
-            val centerFactor = 1.0f - (Math.abs(index - barsCount / 2f) / (barsCount / 2f))
+            val centerFactor = 1.0f - (abs(index - barsCount / 2f) / (barsCount / 2f))
             // Make the wave look like a real master track with some silent/dense sections
             val noise = random.nextFloat()
             val wave = if (index % 12 == 0) 0.15f else if (index % 7 == 0) 0.85f else 0.4f + noise * 0.5f
@@ -624,19 +684,35 @@ fun WaveformDurationBar(
         }
     }
 
-    var isDragging by remember { mutableStateOf(false) }
-    var dragFraction by remember { mutableStateOf(0f) }
+    var isDragging by remember { mutableStateOf(value = false) }
+    var dragFraction by remember { mutableFloatStateOf(0f) }
 
     val currentFraction = if (isDragging) {
         dragFraction
     } else {
         if (duration > 0) progress.toFloat() / duration else 0f
     }.coerceIn(0f, 1f)
+    val seekBarDescription = stringResource(R.string.player_seek_bar)
+    val boundedProgress = if (duration > 0L) progress.coerceIn(0L, duration) else progress.coerceAtLeast(0L)
+    val seekStateDescription = if (duration > 0L) {
+        stringResource(
+            R.string.player_seek_position_of_duration,
+            formatDuration(boundedProgress),
+            formatDuration(duration)
+        )
+    } else {
+        stringResource(R.string.player_seek_duration_unknown, formatDuration(boundedProgress))
+    }
 
-    BoxWithConstraints(
+    Box(
         modifier = modifier
             .fillMaxWidth()
             .height(56.dp)
+            .semantics {
+                contentDescription = seekBarDescription
+                stateDescription = seekStateDescription
+                progressBarRangeInfo = ProgressBarRangeInfo(currentFraction, 0f..1f)
+            }
     ) {
         Canvas(
             modifier = Modifier
@@ -657,7 +733,7 @@ fun WaveformDurationBar(
                         },
                         onDragEnd = {
                             isDragging = false
-                            onSeek((dragFraction * duration).toLong())
+                            if (duration > 0L) onSeek((dragFraction * duration).toLong())
                         },
                         onDragCancel = {
                             isDragging = false

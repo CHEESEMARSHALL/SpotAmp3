@@ -7,6 +7,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.*
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -17,16 +18,20 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
-import coil.request.ImageRequest
-import com.example.data.PlaylistEntity
+import com.example.R
+import com.example.data.PlexMetadata
 import com.example.data.RadioRequest
 import com.example.data.RadioType
 import com.example.data.albumNavigationKey
+import com.example.data.effectiveAlbumArtist
+import com.example.data.sortTrackItemsInPlaybackOrder
 import com.example.playback.TrackItem
 import kotlinx.coroutines.launch
 
@@ -39,7 +44,9 @@ sealed class ContextMenuItem {
         val key: String,
         val thumb: String,
         val duration: Long,
-        val albumRatingKey: String? = null
+        val albumRatingKey: String? = null,
+        val albumArtist: String? = null,
+        val artistRatingKey: String? = null,
     ) : ContextMenuItem() {
         fun toTrackItem() = TrackItem(
             ratingKey = ratingKey,
@@ -49,7 +56,9 @@ sealed class ContextMenuItem {
             key = key,
             thumb = thumb,
             duration = duration,
-            albumRatingKey = albumRatingKey
+            albumRatingKey = albumRatingKey,
+            albumArtist = albumArtist,
+            artistRatingKey = artistRatingKey,
         )
     }
 
@@ -68,6 +77,58 @@ sealed class ContextMenuItem {
     ) : ContextMenuItem()
 }
 
+internal fun PlexMetadata.toAlbumContextTrackItem(
+    album: ContextMenuItem.Album,
+    unknownArtist: String,
+    unknownAlbum: String
+): TrackItem? {
+    val key = media?.firstOrNull()?.part?.firstOrNull()?.key ?: return null
+    return TrackItem(
+        ratingKey = ratingKey,
+        title = title,
+        artist = grandparentTitle?.takeIf(String::isNotBlank)
+            ?: albumArtist?.takeIf(String::isNotBlank)
+            ?: album.artist.takeIf(String::isNotBlank)
+            ?: unknownArtist,
+        album = parentTitle?.takeIf(String::isNotBlank)
+            ?: album.title.takeIf(String::isNotBlank)
+            ?: unknownAlbum,
+        key = key,
+        thumb = thumb ?: album.thumb,
+        duration = duration ?: 0L,
+        albumRatingKey = parentRatingKey ?: album.ratingKey,
+        albumArtist = albumArtist,
+        artistRatingKey = grandparentRatingKey,
+        index = index ?: 0,
+        discNumber = parentIndex?.takeIf { it > 0 } ?: 1
+    )
+}
+
+internal fun PlexMetadata.toArtistQueueTrackItem(
+    artistName: String,
+    unknownArtist: String,
+    unknownAlbum: String
+): TrackItem? {
+    val key = media?.firstOrNull()?.part?.firstOrNull()?.key ?: return null
+    return TrackItem(
+        ratingKey = ratingKey,
+        title = title,
+        artist = grandparentTitle?.takeIf(String::isNotBlank)
+            ?: albumArtist?.takeIf(String::isNotBlank)
+            ?: artistName.takeIf(String::isNotBlank)
+            ?: unknownArtist,
+        album = parentTitle?.takeIf(String::isNotBlank) ?: unknownAlbum,
+        key = key,
+        thumb = thumb.orEmpty(),
+        duration = duration ?: 0L,
+        albumRatingKey = parentRatingKey,
+        albumArtist = albumArtist,
+        artistRatingKey = grandparentRatingKey,
+        index = index ?: 0,
+        discNumber = parentIndex?.takeIf { it > 0 } ?: 1
+    )
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MusicContextMenu(
@@ -78,18 +139,22 @@ fun MusicContextMenu(
     onNavigateToAlbum: (String, String) -> Unit,
     onNavigateToAlbumWithTracks: (String, String, List<TrackItem>) -> Unit = { id, name, _ ->
         onNavigateToAlbum(id, name)
-    }
+    },
+    onRemoveFromQueue: (() -> Unit)? = null
 ) {
     val coroutineScope = rememberCoroutineScope()
     val playlists by viewModel.playlists.collectAsState()
-    var showPlaylistDialog by remember { mutableStateOf(false) }
+    var showPlaylistDialog by remember { mutableStateOf(value = false) }
     var showCreatePlaylistDialog by remember { mutableStateOf(false) }
     var newPlaylistName by remember { mutableStateOf("") }
+    var isCreatingPlaylist by remember { mutableStateOf(false) }
+    var createPlaylistError by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
     val baseUrl = viewModel.repository.settings.baseUrl
     val token = viewModel.repository.settings.token
-    val normalizedBaseUrl = if (baseUrl.endsWith("/")) baseUrl.dropLast(1) else baseUrl
+    val unknownArtistLabel = stringResource(R.string.common_unknown_artist)
+    val unknownAlbumLabel = stringResource(R.string.common_unknown_album)
 
     // Retrieve cover photo or thumb url
     val thumb = when (item) {
@@ -100,20 +165,14 @@ fun MusicContextMenu(
     val imageUrl = if (thumb.isNotEmpty()) resolveArtworkUrl(baseUrl, thumb) else null
 
     suspend fun albumTrackItems(album: ContextMenuItem.Album): List<TrackItem> {
-        if (album.tracks.isNotEmpty()) return album.tracks
-        return viewModel.repository.getAlbumTracks(album.ratingKey).mapNotNull { track ->
-            val key = track.media?.firstOrNull()?.part?.firstOrNull()?.key ?: return@mapNotNull null
-            TrackItem(
-                ratingKey = track.ratingKey,
-                title = track.title,
-                artist = track.grandparentTitle ?: track.parentTitle ?: album.artist,
-                album = track.parentTitle ?: album.title,
-                key = key,
-                thumb = track.thumb ?: album.thumb,
-                duration = track.duration ?: 0L,
-                albumRatingKey = album.ratingKey
-            )
+        val tracks = if (album.tracks.isNotEmpty()) {
+            album.tracks
+        } else {
+            viewModel.repository.getAlbumTracks(album.ratingKey).mapNotNull { track ->
+                track.toAlbumContextTrackItem(album, unknownArtistLabel, unknownAlbumLabel)
+            }
         }
+        return sortTrackItemsInPlaybackOrder(tracks)
     }
 
     val title = when (item) {
@@ -123,9 +182,9 @@ fun MusicContextMenu(
     }
 
     val subtitle = when (item) {
-        is ContextMenuItem.Track -> "${item.artist} • ${item.album}"
-        is ContextMenuItem.Album -> item.artist
-        is ContextMenuItem.Artist -> "Artist"
+        is ContextMenuItem.Track -> localizedArtistAlbumSubtitle(item.artist, item.album)
+        is ContextMenuItem.Album -> localizedArtistPresentation(item.artist)
+        is ContextMenuItem.Artist -> stringResource(R.string.music_context_artist)
     }
 
     ModalBottomSheet(
@@ -154,7 +213,7 @@ fun MusicContextMenu(
                     if (imageUrl != null) {
                         AsyncImage(
                             model = authenticatedArtworkRequest(context, imageUrl, token),
-                            contentDescription = title,
+                            contentDescription = null,
                             contentScale = ContentScale.Crop,
                             modifier = Modifier.fillMaxSize()
                         )
@@ -213,7 +272,7 @@ fun MusicContextMenu(
                 item {
                     ContextMenuOption(
                         icon = Icons.Rounded.PlayArrow,
-                        label = "Play"
+                        label = stringResource(R.string.common_action_play)
                     ) {
                         coroutineScope.launch {
                             when (item) {
@@ -232,9 +291,7 @@ fun MusicContextMenu(
                                     albums.forEach { album ->
                                         val tracks = viewModel.repository.getAlbumTracks(album.ratingKey)
                                         tracks.forEach { t ->
-                                            t.media?.firstOrNull()?.part?.firstOrNull()?.key?.let { key ->
-                                                allTracks.add(TrackItem(t.ratingKey, t.title, t.grandparentTitle ?: t.parentTitle ?: "Unknown", t.parentTitle ?: "Unknown", key, t.thumb ?: "", t.duration ?: 0L))
-                                            }
+                                            t.toArtistQueueTrackItem(item.name, unknownArtistLabel, unknownAlbumLabel)?.let(allTracks::add)
                                         }
                                     }
                                     if (allTracks.isNotEmpty()) {
@@ -251,7 +308,7 @@ fun MusicContextMenu(
                 item {
                     ContextMenuOption(
                         icon = Icons.Rounded.Shuffle,
-                        label = "Shuffle"
+                        label = stringResource(R.string.music_context_shuffle)
                     ) {
                         coroutineScope.launch {
                             val allTracks = when (item) {
@@ -263,9 +320,7 @@ fun MusicContextMenu(
                                     albums.forEach { album ->
                                         val tracks = viewModel.repository.getAlbumTracks(album.ratingKey)
                                         tracks.forEach { t ->
-                                            t.media?.firstOrNull()?.part?.firstOrNull()?.key?.let { key ->
-                                                list.add(TrackItem(t.ratingKey, t.title, t.grandparentTitle ?: t.parentTitle ?: "Unknown", t.parentTitle ?: "Unknown", key, t.thumb ?: "", t.duration ?: 0L))
-                                            }
+                                            t.toArtistQueueTrackItem(item.name, unknownArtistLabel, unknownAlbumLabel)?.let(list::add)
                                         }
                                     }
                                     list
@@ -282,9 +337,9 @@ fun MusicContextMenu(
                 // 3. Radio
                 item {
                     val label = when (item) {
-                        is ContextMenuItem.Track -> "Play track radio"
-                        is ContextMenuItem.Album -> "Play album radio"
-                        is ContextMenuItem.Artist -> "Play artist radio"
+                        is ContextMenuItem.Track -> stringResource(R.string.music_context_track_radio)
+                        is ContextMenuItem.Album -> stringResource(R.string.music_context_album_radio)
+                        is ContextMenuItem.Artist -> stringResource(R.string.music_context_artist_radio)
                     }
                     ContextMenuOption(
                         icon = Icons.Rounded.Radio,
@@ -313,7 +368,7 @@ fun MusicContextMenu(
                 item {
                     ContextMenuOption(
                         icon = Icons.Rounded.QueuePlayNext,
-                        label = "Play Next"
+                        label = stringResource(R.string.music_context_play_next)
                     ) {
                         coroutineScope.launch {
                             when (item) {
@@ -330,9 +385,7 @@ fun MusicContextMenu(
                                     albums.forEach { album ->
                                         val tracks = viewModel.repository.getAlbumTracks(album.ratingKey)
                                         tracks.forEach { t ->
-                                            t.media?.firstOrNull()?.part?.firstOrNull()?.key?.let { key ->
-                                                all.add(TrackItem(t.ratingKey, t.title, t.grandparentTitle ?: t.parentTitle ?: "Unknown", t.parentTitle ?: "Unknown", key, t.thumb ?: "", t.duration ?: 0L))
-                                            }
+                                            t.toArtistQueueTrackItem(item.name, unknownArtistLabel, unknownAlbumLabel)?.let(all::add)
                                         }
                                     }
                                     viewModel.playbackManager.playTracksNext(all)
@@ -346,8 +399,8 @@ fun MusicContextMenu(
                 // 5. Add to queue
                 item {
                     ContextMenuOption(
-                        icon = Icons.Rounded.PlaylistAdd,
-                        label = "Add to queue"
+                        icon = Icons.AutoMirrored.Rounded.PlaylistAdd,
+                        label = stringResource(R.string.music_context_add_to_queue)
                     ) {
                         coroutineScope.launch {
                             when (item) {
@@ -364,9 +417,7 @@ fun MusicContextMenu(
                                     albums.forEach { album ->
                                         val tracks = viewModel.repository.getAlbumTracks(album.ratingKey)
                                         tracks.forEach { t ->
-                                            t.media?.firstOrNull()?.part?.firstOrNull()?.key?.let { key ->
-                                                all.add(TrackItem(t.ratingKey, t.title, t.grandparentTitle ?: t.parentTitle ?: "Unknown", t.parentTitle ?: "Unknown", key, t.thumb ?: "", t.duration ?: 0L))
-                                            }
+                                            t.toArtistQueueTrackItem(item.name, unknownArtistLabel, unknownAlbumLabel)?.let(all::add)
                                         }
                                     }
                                     viewModel.playbackManager.addTracksToQueue(all)
@@ -377,11 +428,23 @@ fun MusicContextMenu(
                     }
                 }
 
+                if (onRemoveFromQueue != null) {
+                    item {
+                        ContextMenuOption(
+                            icon = Icons.Rounded.DeleteOutline,
+                            label = stringResource(R.string.player_remove_from_queue)
+                        ) {
+                            onRemoveFromQueue()
+                            onDismiss()
+                        }
+                    }
+                }
+
                 // 6. Add to playlist
                 item {
                     ContextMenuOption(
                         icon = Icons.Rounded.Add,
-                        label = "Add to playlist"
+                        label = stringResource(R.string.library_add_to_playlist)
                     ) {
                         showPlaylistDialog = true
                     }
@@ -392,14 +455,28 @@ fun MusicContextMenu(
                     is ContextMenuItem.Track -> {
                         item {
                             ContextMenuOption(
+                                icon = Icons.Rounded.Person,
+                                label = stringResource(R.string.music_context_go_to_artist)
+                            ) {
+                                coroutineScope.launch {
+                                    onNavigateToArtist(
+                                        item.artistRatingKey ?: com.example.data.artistNavigationKey(item.artist),
+                                        item.artist
+                                    )
+                                    onDismiss()
+                                }
+                            }
+                        }
+                        item {
+                            ContextMenuOption(
                                 icon = Icons.Rounded.Album,
-                                label = "Go to album"
+                                label = stringResource(R.string.music_context_go_to_album)
                             ) {
                                 coroutineScope.launch {
                                     // Plex track details usually have parents, but to be simple and accurate, we find the track metadata
                                     // Since Plex track lists have parentRatingKey, let's navigate to the album
                                     onNavigateToAlbumWithTracks(
-                                        item.albumRatingKey ?: albumNavigationKey(item.artist, item.album),
+                                        item.albumRatingKey ?: albumNavigationKey(effectiveAlbumArtist(item.albumArtist, item.artist), item.album),
                                         item.album,
                                         listOf(item.toTrackItem())
                                     )
@@ -412,7 +489,7 @@ fun MusicContextMenu(
                         item {
                             ContextMenuOption(
                                 icon = Icons.Rounded.Person,
-                                label = "Go to artist"
+                                label = stringResource(R.string.music_context_go_to_artist)
                             ) {
                                 coroutineScope.launch {
                                     onNavigateToArtist(item.ratingKey, item.artist)
@@ -429,9 +506,9 @@ fun MusicContextMenu(
                 // 8. Download
                 item {
                     val label = when (item) {
-                        is ContextMenuItem.Track -> "Download track"
-                        is ContextMenuItem.Album -> "Download full album"
-                        is ContextMenuItem.Artist -> "Download artist catalog"
+                        is ContextMenuItem.Track -> stringResource(R.string.music_context_download_track)
+                        is ContextMenuItem.Album -> stringResource(R.string.music_context_download_album)
+                        is ContextMenuItem.Artist -> stringResource(R.string.music_context_download_artist)
                     }
                     ContextMenuOption(
                         icon = Icons.Rounded.Download,
@@ -449,9 +526,9 @@ fun MusicContextMenu(
                 // 9. Build album/song/artist mix through the selected provider
                 item {
                     val label = when (item) {
-                        is ContextMenuItem.Track -> "Build song mix"
-                        is ContextMenuItem.Album -> "Build album mix"
-                        is ContextMenuItem.Artist -> "Build artist mix"
+                        is ContextMenuItem.Track -> stringResource(R.string.music_context_build_song_mix)
+                        is ContextMenuItem.Album -> stringResource(R.string.music_context_build_album_mix)
+                        is ContextMenuItem.Artist -> stringResource(R.string.music_context_build_artist_mix)
                     }
                     ContextMenuOption(
                         icon = Icons.Rounded.AutoAwesome,
@@ -474,7 +551,7 @@ fun MusicContextMenu(
     if (showPlaylistDialog) {
         AlertDialog(
             onDismissRequest = { showPlaylistDialog = false },
-            title = { Text("Add to Playlist", color = Color.White) },
+            title = { Text(stringResource(R.string.library_add_to_playlist), color = Color.White) },
             containerColor = Color(0xFF1E1E24),
             text = {
                 Column(modifier = Modifier.fillMaxWidth()) {
@@ -483,7 +560,7 @@ fun MusicContextMenu(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable {
+                            .clickable(role = Role.Button) {
                                 showCreatePlaylistDialog = true
                                 showPlaylistDialog = false
                             }
@@ -491,7 +568,11 @@ fun MusicContextMenu(
                     ) {
                         Icon(Icons.Rounded.Add, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                         Spacer(modifier = Modifier.width(16.dp))
-                        Text("Create New Playlist", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            stringResource(R.string.library_create_new_playlist),
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
 
                     HorizontalDivider(color = Color.White.copy(alpha = 0.05f))
@@ -499,7 +580,7 @@ fun MusicContextMenu(
                     // Existing playlists
                     if (playlists.isEmpty()) {
                         Text(
-                            text = "No existing playlists. Tap above to create one.",
+                            text = stringResource(R.string.library_context_empty_playlists),
                             color = Color.White.copy(alpha = 0.5f),
                             modifier = Modifier.padding(vertical = 16.dp),
                             fontSize = 14.sp
@@ -511,7 +592,7 @@ fun MusicContextMenu(
                                     verticalAlignment = Alignment.CenterVertically,
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .clickable {
+                                        .clickable(role = Role.Button) {
                                             when (item) {
                                                 is ContextMenuItem.Track -> {
                                                     viewModel.addTrackToPlaylist(playlist.id, item.toTrackItem())
@@ -528,7 +609,7 @@ fun MusicContextMenu(
                                         }
                                         .padding(vertical = 12.dp)
                                 ) {
-                                    Icon(Icons.Rounded.QueueMusic, contentDescription = null, tint = Color.White.copy(alpha = 0.6f))
+                                    Icon(Icons.AutoMirrored.Rounded.QueueMusic, contentDescription = null, tint = Color.White.copy(alpha = 0.6f))
                                     Spacer(modifier = Modifier.width(16.dp))
                                     Text(playlist.name, color = Color.White)
                                 }
@@ -540,7 +621,7 @@ fun MusicContextMenu(
             confirmButton = {},
             dismissButton = {
                 TextButton(onClick = { showPlaylistDialog = false }) {
-                    Text("Cancel", color = Color.White.copy(alpha = 0.6f))
+                    Text(stringResource(R.string.library_cancel_playlist_creation), color = Color.White.copy(alpha = 0.6f))
                 }
             }
         )
@@ -548,55 +629,47 @@ fun MusicContextMenu(
 
     // Dialog for creating a new playlist
     if (showCreatePlaylistDialog) {
-        AlertDialog(
-            onDismissRequest = { showCreatePlaylistDialog = false },
-            title = { Text("New Playlist", color = Color.White) },
-            containerColor = Color(0xFF1E1E24),
-            text = {
-                OutlinedTextField(
-                    value = newPlaylistName,
-                    onValueChange = { newPlaylistName = it },
-                    placeholder = { Text("Playlist name", color = Color.White.copy(alpha = 0.4f)) },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedTextColor = Color.White,
-                        unfocusedTextColor = Color.White,
-                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                        unfocusedBorderColor = Color.White.copy(alpha = 0.2f)
-                    ),
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+        LibraryCreatePlaylistDialog(
+            name = newPlaylistName,
+            isCreating = isCreatingPlaylist,
+            showError = createPlaylistError,
+            onNameChange = {
+                newPlaylistName = it
+                createPlaylistError = false
             },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        if (newPlaylistName.isNotBlank()) {
-                            viewModel.createPlaylist(newPlaylistName) { newId ->
-                                when (item) {
-                                    is ContextMenuItem.Track -> {
-                                        viewModel.addTrackToPlaylist(newId.toInt(), item.toTrackItem())
-                                    }
-                                    is ContextMenuItem.Album -> {
-                                        viewModel.addAlbumToPlaylist(newId.toInt(), item.ratingKey)
-                                    }
-                                    is ContextMenuItem.Artist -> {
-                                        viewModel.addArtistToPlaylist(newId.toInt(), item.ratingKey)
-                                    }
-                                }
-                            }
-                            showCreatePlaylistDialog = false
-                            onDismiss()
-                        }
+            onDismiss = {
+                if (isCreatingPlaylist) return@LibraryCreatePlaylistDialog
+                showCreatePlaylistDialog = false
+                newPlaylistName = ""
+                createPlaylistError = false
+            },
+            onCreate = { name ->
+                isCreatingPlaylist = true
+                createPlaylistError = false
+                viewModel.createPlaylist(
+                    name = name,
+                    onFailure = {
+                        isCreatingPlaylist = false
+                        createPlaylistError = true
                     },
-                    enabled = newPlaylistName.isNotBlank()
-                ) {
-                    Text("Create")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showCreatePlaylistDialog = false }) {
-                    Text("Cancel", color = Color.White.copy(alpha = 0.6f))
-                }
+                    onCreated = { newId ->
+                        when (item) {
+                            is ContextMenuItem.Track -> {
+                                viewModel.addTrackToPlaylist(newId.toInt(), item.toTrackItem())
+                            }
+                            is ContextMenuItem.Album -> {
+                                viewModel.addAlbumToPlaylist(newId.toInt(), item.ratingKey)
+                            }
+                            is ContextMenuItem.Artist -> {
+                                viewModel.addArtistToPlaylist(newId.toInt(), item.ratingKey)
+                            }
+                        }
+                        showCreatePlaylistDialog = false
+                        newPlaylistName = ""
+                        isCreatingPlaylist = false
+                        onDismiss()
+                    }
+                )
             }
         )
     }
@@ -613,7 +686,7 @@ fun ContextMenuOption(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
-            .clickable { onClick() }
+            .clickable(role = Role.Button, onClick = onClick)
             .padding(vertical = 12.dp, horizontal = 12.dp)
     ) {
         Icon(

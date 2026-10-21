@@ -2,7 +2,6 @@ package com.example.data
 
 import android.content.Context
 import android.util.Log
-import com.example.BuildConfig
 import com.example.playback.TrackItem
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -122,6 +121,30 @@ class SmartSearchService {
         ).any(normalized::contains) || Regex("(19|20)\\d0s").containsMatchIn(normalized)
     }
 
+    /**
+     * Identifies queries that name an analysis facet present in the saved
+     * intelligence snapshot, including labels whose model component is no
+     * longer complete. Those queries must remain local: falling back to a
+     * broad server search could re-expose a stale facet that local search has
+     * intentionally filtered out.
+     */
+    fun isKnownAnalysisLabelQuery(query: String, cachedTracks: List<CachedTrack>): Boolean {
+        val normalizedQuery = query.trim().lowercase(Locale.ROOT)
+        if (normalizedQuery.isEmpty()) return false
+
+        return cachedTracks.asSequence()
+            .mapNotNull { track ->
+                track.musicIntelligenceJson.takeIf(String::isNotBlank)
+                    ?.let { runCatching { BackendIntelligenceJson.decode(it) }.getOrNull() }
+            }
+            .flatMap { it.labels.asSequence() }
+            .filter { it.type.equals("mood", ignoreCase = true) ||
+                it.type.equals("style", ignoreCase = true) ||
+                it.type.equals("genre", ignoreCase = true) }
+            .map { it.value.trim().lowercase(Locale.ROOT) }
+            .any { label -> label.isNotEmpty() && normalizedQuery.contains(label) }
+    }
+
     fun parse(query: String, cachedTracks: List<CachedTrack>): SmartSearchIntent {
         val normalized = query.lowercase(Locale.ROOT)
         val artists = cachedTracks.map { it.artist }.distinct().filter { normalized.contains(it.lowercase(Locale.ROOT)) }
@@ -151,9 +174,12 @@ class SmartSearchService {
     }
 
     fun filter(intent: SmartSearchIntent, tracks: List<CachedTrack>, downloadedKeys: Set<String> = emptySet()): List<CachedTrack> {
+        val tagService = LocalMetadataTagService()
         return tracks.map { track ->
             var score = 0
-            val haystack = "${track.title} ${track.artist} ${track.album} ${track.genres} ${track.collections}".lowercase(Locale.ROOT)
+            val tags = tagService.tag(track)
+            val analysisText = "${tags.moods.joinToString(" ")} ${tags.styleTags.joinToString(" ")} ${tags.energy} energy"
+            val haystack = "${track.title} ${track.artist} ${track.album} ${track.genres} ${track.collections} $analysisText".lowercase(Locale.ROOT)
             val genreMatch = intent.genres.isEmpty() || intent.genres.any { haystack.contains(it) }
             if (!genreMatch) return@map track to -1
             if (intent.decade != null && track.year !in intent.decade..(intent.decade + 9)) return@map track to -1
@@ -180,7 +206,7 @@ class SmartSearchService {
 }
 
 // ==============================================================
-// 2. AIProvider Interface & Implementations (Cloud, Local, NoAI)
+// 2. AIProvider Interface & Implementations (Local, NoAI)
 // ==============================================================
 interface AIProvider {
     val name: String
@@ -199,79 +225,6 @@ class HybridAIProvider : AIProvider {
     override val name = "Hybrid AI (Local first)"
     override suspend fun generatePlaylistIntent(prompt: String, cachedTracks: List<CachedTrack>): PlaylistIntent =
         local.generatePlaylistIntent(prompt, cachedTracks)
-}
-
-class CloudAIProvider : AIProvider {
-    override val name = "Cloud AI Provider"
-
-    override suspend fun generatePlaylistIntent(prompt: String, cachedTracks: List<CachedTrack>): PlaylistIntent = withContext(Dispatchers.IO) {
-        val geminiApiKey = BuildConfig.GEMINI_API_KEY
-        if (geminiApiKey.isEmpty() || geminiApiKey.contains("GEMINI_API_KEY")) {
-            throw IllegalStateException("Gemini API key is not configured in the Secrets panel.")
-        }
-
-        // We summarize artists and genres to help Gemini select correct seed info
-        val availableArtists = cachedTracks.map { it.artist }.distinct().take(100).joinToString(", ")
-        val availableAlbums = cachedTracks.map { it.album }.distinct().take(50).joinToString(", ")
-
-        val systemInstructionText = """
-            You are a Sonic Sage AI music interpreter. You translate natural language user queries into a structured playlist intent JSON object.
-            You must analyze the user prompt and extract seeds, genres, and styles.
-            
-            IMPORTANT:
-            - Never invent track titles from memory.
-            - Only reference the provided lists of available artists and albums if possible.
-            - Ensure output strictly matches the PlaylistIntent JSON schema.
-            - Do not return any markdown formatting, backticks, or other text. Only valid raw JSON.
-            
-            AVAILABLE ARTISTS SAMPLE: $availableArtists
-            AVAILABLE ALBUMS SAMPLE: $availableAlbums
-            
-            JSON Schema:
-            {
-              "seedArtists": ["ArtistName"],
-              "seedAlbums": ["AlbumName"],
-              "seedTracks": [],
-              "genres": ["metalcore", "soundtrack"],
-              "moods": ["dark", "energetic"],
-              "energyLevel": "high",
-              "decadeRange": "2000s",
-              "includeCollections": true,
-              "excludeGenres": [],
-              "excludeArtists": [],
-              "preferFamiliar": true,
-              "preferDeepCuts": false,
-              "targetTrackCount": 30,
-              "sortStrategy": "high_energy",
-              "explanation": "Brief explanation of interpretation"
-            }
-        """.trimIndent()
-
-        val request = GeminiRequest(
-            contents = listOf(GeminiContent(parts = listOf(GeminiPart(text = prompt)))),
-            systemInstruction = GeminiContent(parts = listOf(GeminiPart(text = systemInstructionText))),
-            generationConfig = GeminiGenerationConfig(
-                responseMimeType = "application/json",
-                temperature = 0.2f
-            )
-        )
-
-        try {
-            val response = GeminiClient.service.generateContent(geminiApiKey, request)
-            val jsonText = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text ?: ""
-            Log.d("CloudAIProvider", "Gemini response received (${jsonText.length} chars)")
-
-            val json = Json { 
-                ignoreUnknownKeys = true
-                coerceInputValues = true
-            }
-            json.decodeFromString<PlaylistIntent>(jsonText)
-        } catch (e: Exception) {
-            Log.e("CloudAIProvider", "Error parsing Gemini response, falling back to Local parser", e)
-            // Fallback to local parser on parse error or network error
-            LocalAIProvider().generatePlaylistIntent(prompt, cachedTracks)
-        }
-    }
 }
 
 class LocalAIProvider : AIProvider {
@@ -619,4 +572,3 @@ class RecommendationEngine(private val context: Context) {
         }
     }
 }
-

@@ -1,0 +1,7 @@
+{
+  "eventId": "fixture-event-1",
+  "trackId": "track-42",
+  "playedAt": 1700000000123,
+  "listenedMs": 45000,
+  "source": "spotamp"
+}

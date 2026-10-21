@@ -26,7 +26,7 @@ object LyricsParser {
             val matches = timestampRegex.findAll(line).toList()
             if (matches.isEmpty()) {
                 // It's a metadata line or plain text line in LRC.
-                if (!line.startsWith("[") || !line.contains(":")) {
+                if (!line.startsWith("[")) {
                     lyricLines.add(LyricLine(null, line))
                 }
                 return@forEach
@@ -66,4 +66,16 @@ object LyricsParser {
         val hasAnySynced = sortedLines.any { it.timestampMs != null }
         return Lyrics(sortedLines, isSynced = hasAnySynced)
     }
+}
+
+
+/** Prevents a cancelled, slow lyrics request from publishing into a newer track. */
+class LyricsRequestGate {
+    private var generation = 0L
+
+    @Synchronized
+    fun begin(): Long = ++generation
+
+    @Synchronized
+    fun isCurrent(requestGeneration: Long): Boolean = requestGeneration == generation
 }

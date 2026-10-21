@@ -189,7 +189,7 @@ private val SolarizedDarkColorScheme = darkColorScheme(
 )
 
 private val WarmLightColorScheme = lightColorScheme(
-    primary = Color(0xFFD97706), // Warm amber
+    primary = Color(0xFF9A3412), // Deep amber for readable text and controls on cream surfaces
     onPrimary = Color(0xFFFFFFFF),
     secondary = Color(0xFF78350F), // Warm brown
     onSecondary = Color(0xFFFFFFFF),

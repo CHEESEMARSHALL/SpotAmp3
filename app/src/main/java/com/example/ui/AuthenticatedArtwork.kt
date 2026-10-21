@@ -2,12 +2,30 @@ package com.example.ui
 
 import android.content.Context
 import coil.request.ImageRequest
+import com.example.R
+import com.example.data.resolveArtworkReference
 import com.example.data.PlexSettingsManager
+import com.example.data.originCredentialsForUrl
 
 fun resolveArtworkUrl(baseUrl: String, path: String): String {
-    val trimmed = path.trim()
-    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) return trimmed
-    return "${baseUrl.trimEnd('/')}$trimmed"
+    return resolveArtworkReference(baseUrl, path)
+}
+
+private object ArtworkSettingsCache {
+    private val lock = Any()
+    private var applicationContext: Context? = null
+    private var settings: PlexSettingsManager? = null
+
+    fun get(context: Context): PlexSettingsManager {
+        val appContext = context.applicationContext
+        synchronized(lock) {
+            if (settings == null || applicationContext !== appContext) {
+                applicationContext = appContext
+                settings = PlexSettingsManager(appContext)
+            }
+            return settings!!
+        }
+    }
 }
 
 fun authenticatedArtworkRequest(
@@ -15,19 +33,33 @@ fun authenticatedArtworkRequest(
     imageUrl: String,
     plexToken: String
 ): ImageRequest {
-    val settings = PlexSettingsManager(context)
-    val companionBase = settings.companionBackendUrl.trimEnd('/')
-    val isCompanionUrl = companionBase.isNotBlank() &&
-        (imageUrl == companionBase || imageUrl.startsWith("$companionBase/"))
-    return ImageRequest.Builder(context)
-        .data(imageUrl)
+    val settings = ArtworkSettingsCache.get(context)
+    val normalizedUrl = imageUrl.replace(" ", "%20")
+    val credentials = originCredentialsForUrl(
+        normalizedUrl,
+        settings.companionBackendUrl,
+        settings.companionBackendToken,
+        settings.baseUrl,
+        plexToken
+    )
+
+    // Keep the URL used by Coil consistent with the URL used for origin
+    // matching. Plex artwork paths frequently contain spaces or other
+    // characters that need encoding before the request is built.
+    val fullUrl = normalizedUrl
+
+    return ImageRequest.Builder(context.applicationContext)
+        .data(fullUrl)
         .apply {
-            if (isCompanionUrl && settings.companionBackendToken.isNotBlank()) {
-                addHeader("Authorization", "Bearer ${settings.companionBackendToken}")
-            } else if (plexToken.isNotBlank()) {
-                addHeader("X-Plex-Token", plexToken)
-            }
+            credentials.headers
+                .forEach { (name, value) -> addHeader(name, value) }
         }
-        .crossfade(true)
+        .placeholder(R.drawable.ic_artwork_placeholder)
+        .error(R.drawable.ic_artwork_placeholder)
+        .memoryCacheKey(fullUrl)
+        .diskCacheKey(fullUrl)
+        // Large lazy lists should not animate every thumbnail as it enters the
+        // viewport. Full-screen surfaces still get the same decoded image.
+        .crossfade(false)
         .build()
 }

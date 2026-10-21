@@ -1,0 +1,8 @@
+{
+  "contractVersion": "1.4",
+  "token": "fixture-device-token",
+  "device": {
+    "id": "fixture-device-1",
+    "name": "SpotAmp fixture"
+  }
+}

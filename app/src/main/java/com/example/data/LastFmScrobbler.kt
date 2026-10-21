@@ -5,6 +5,7 @@ import android.util.Log
 import android.widget.Toast
 import com.example.playback.TrackItem
 import android.net.Uri
+import androidx.annotation.VisibleForTesting
 import org.json.JSONObject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -19,7 +20,12 @@ object LastFmScrobbler {
     private const val TAG = "LastFmScrobbler"
     private const val BASE_URL = "https://ws.audioscrobbler.com/2.0/"
 
-    private val client = OkHttpClient()
+    @VisibleForTesting
+    internal var endpointOverrideForTest: String? = null
+
+    private val client = OkHttpClient.Builder()
+        .addInterceptor(QaNetworkInterceptor())
+        .build()
     private val scope = CoroutineScope(Dispatchers.IO)
 
     fun updateNowPlaying(context: Context, settings: PlexSettingsManager, track: TrackItem) {
@@ -50,7 +56,7 @@ object LastFmScrobbler {
                 params.forEach { (k, v) -> bodyBuilder.add(k, v) }
 
                 val request = Request.Builder()
-                    .url(BASE_URL)
+                    .url(endpointOverrideForTest ?: BASE_URL)
                     .post(bodyBuilder.build())
                     .build()
 
@@ -99,7 +105,7 @@ object LastFmScrobbler {
                 params.forEach { (k, v) -> bodyBuilder.add(k, v) }
 
                 val request = Request.Builder()
-                    .url(BASE_URL)
+                    .url(endpointOverrideForTest ?: BASE_URL)
                     .post(bodyBuilder.build())
                     .build()
 
@@ -170,7 +176,7 @@ object LastFmScrobbler {
             params["api_sig"] = calculateSignature(params, settings.lastFmApiSecret)
             params["format"] = "json"
             val body = FormBody.Builder().apply { params.forEach { (k, v) -> add(k, v) } }.build()
-            client.newCall(Request.Builder().url(BASE_URL).post(body).build()).execute().use { response ->
+            client.newCall(Request.Builder().url(endpointOverrideForTest ?: BASE_URL).post(body).build()).execute().use { response ->
                 val raw = response.body?.string().orEmpty()
                 if (!response.isSuccessful) Result.failure(IllegalStateException("Last.fm HTTP ${response.code}"))
                 else if (JSONObject(raw).has("error")) Result.failure(IllegalStateException(JSONObject(raw).optString("message", "Last.fm authorization failed")))

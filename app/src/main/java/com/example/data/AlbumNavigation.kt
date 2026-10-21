@@ -2,6 +2,7 @@ package com.example.data
 
 private const val ALBUM_NAVIGATION_PREFIX = "spotamp-album:"
 private const val ALBUM_NAVIGATION_SEPARATOR = '\u0000'
+private const val ARTIST_NAVIGATION_PREFIX = "spotcore-artist:"
 
 /**
  * Stable local album identity used by cached and companion-backed Home items.
@@ -10,6 +11,12 @@ private const val ALBUM_NAVIGATION_SEPARATOR = '\u0000'
  */
 fun albumNavigationKey(artist: String, album: String): String =
     "$ALBUM_NAVIGATION_PREFIX$artist$ALBUM_NAVIGATION_SEPARATOR$album"
+
+/**
+ * Stable local artist identity.
+ */
+fun artistNavigationKey(artist: String): String =
+    "$ARTIST_NAVIGATION_PREFIX$artist"
 
 /** Supports the current local key plus the older companion/cache key format. */
 fun parseAlbumNavigationKey(value: String): Pair<String, String>? {

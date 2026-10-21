@@ -1,6 +1,10 @@
 package com.example
 
 import com.example.data.CachedTrack
+import com.example.data.BackendAnalysisComponentDto
+import com.example.data.BackendIntelligenceJson
+import com.example.data.BackendIntelligenceLabelDto
+import com.example.data.BackendTrackIntelligenceDto
 import com.example.data.RadioRequest
 import com.example.data.RadioService
 import com.example.data.RadioType
@@ -10,6 +14,77 @@ import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class RadioServiceTest {
+    @Test
+    fun moodAndStyleRadioUseCurrentSyncedAnalysisLabels() {
+        val analyzed = clapTrack("analyzed", "Complete")
+        val ordinaryGenre = CachedTrack("genre", "Genre", "Artist Genre", "Album", "/genre", "", 1, genres = "Electronic")
+        val tracks = listOf(analyzed, ordinaryGenre)
+        val service = RadioService()
+
+        val moodTracks = service.generate(
+            RadioRequest(RadioType.MOOD_RADIO, mood = "warm", trackCount = 10, recentCooldownDays = 0),
+            tracks
+        )
+        val styleTracks = service.generate(
+            RadioRequest(RadioType.STYLE_RADIO, style = "synth-pop", trackCount = 10, recentCooldownDays = 0),
+            tracks
+        )
+        val genreTracks = service.generate(
+            RadioRequest(RadioType.GENRE_RADIO, genre = "Electronic", trackCount = 10, recentCooldownDays = 0),
+            tracks
+        )
+
+        assertEquals(listOf("analyzed"), moodTracks.map { it.ratingKey })
+        assertEquals(listOf("analyzed"), styleTracks.map { it.ratingKey })
+        assertEquals(setOf("analyzed", "genre"), genreTracks.map { it.ratingKey }.toSet())
+    }
+
+    @Test
+    fun runningClapKeepsLockedMoodsAndHidesInferredStyleRadioTags() {
+        val track = clapTrack("partial", "Running")
+        val service = RadioService()
+
+        assertEquals(
+            listOf("partial"),
+            service.generate(
+                RadioRequest(RadioType.MOOD_RADIO, mood = "warm", trackCount = 10, recentCooldownDays = 0),
+                listOf(track)
+            ).map { it.ratingKey }
+        )
+        assertEquals(
+            emptyList<String>(),
+            service.generate(
+                RadioRequest(RadioType.STYLE_RADIO, style = "synth-pop", trackCount = 10, recentCooldownDays = 0),
+                listOf(track)
+            ).map { it.ratingKey }
+        )
+    }
+
+    private fun clapTrack(id: String, state: String): CachedTrack = CachedTrack(
+        ratingKey = id,
+        title = id,
+        artist = "Artist $id",
+        album = "Album",
+        key = "/$id",
+        thumb = "",
+        duration = 1000,
+        genres = "Electronic",
+        musicIntelligenceJson = BackendIntelligenceJson.encode(
+            BackendTrackIntelligenceDto(
+                trackId = id,
+                components = listOf(BackendAnalysisComponentDto("clap", state, "qa-clap-v1")),
+                labels = listOf(
+                    BackendIntelligenceLabelDto(
+                        type = "mood", value = "warm", source = "clap-zero-shot", manuallyLocked = true
+                    ),
+                    BackendIntelligenceLabelDto(
+                        type = "genre", value = "synth-pop", source = "clap-zero-shot"
+                    )
+                )
+            )
+        )
+    )
+
     @Test
     fun `artist radio only returns seeded artist tracks`() {
         val tracks = listOf(
@@ -29,7 +104,7 @@ class RadioServiceTest {
         )
 
         val result = RadioService().generate(
-            RadioRequest(RadioType.STYLE_RADIO, genre = "rock", trackCount = 10, recentCooldownDays = 0),
+            RadioRequest(RadioType.STYLE_RADIO, style = "rock", trackCount = 10, recentCooldownDays = 0),
             tracks
         )
 

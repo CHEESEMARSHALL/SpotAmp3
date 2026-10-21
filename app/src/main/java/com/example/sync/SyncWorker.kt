@@ -18,9 +18,9 @@ class SyncWorker(
             val repository = MusicRepository(applicationContext)
             val settings = repository.settings
             val useCompanion = settings.isCompanionConfigured
-            val sectionId = settings.sectionId.ifBlank { if (useCompanion) "spotcore" else "" }
+            val sectionId = if (useCompanion) "spotcore" else settings.sectionId
 
-            if ((!settings.isConfigured && !useCompanion) || sectionId.isEmpty()) {
+            if ((!settings.isPlexConfigured && !useCompanion) || sectionId.isEmpty()) {
                 Log.w("SyncWorker", "Sync skipped: no music backend configured or sectionId empty")
                 return@withContext Result.failure()
             }

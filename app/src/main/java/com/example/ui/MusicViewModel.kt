@@ -2,23 +2,46 @@ package com.example.ui
 
 import android.app.Application
 import android.util.Log
+import com.example.BuildConfig
+import com.example.R
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.MusicRepository
 import com.example.data.PlexDirectory
 import com.example.data.PlexMetadata
 import com.example.data.CachedTrack
-import com.example.data.SyncStateEntity
+import com.example.data.DownloadedTrackEntity
+import com.example.data.ListeningHistoryEntity
 import com.example.data.RadioRequest
 import com.example.data.RadioService
 import com.example.data.DiscoveryLevel
+import com.example.data.SavedStationRecipe
+import com.example.data.SavedStationRecipeStore
+import com.example.data.generateSavedStationTracks
+import com.example.data.DiscoveryTuning
+import com.example.data.DiscoveryTuningStore
+import com.example.data.applyDiscoveryTuning
+import com.example.data.filterDiscoveryTracks
 import com.example.data.RecentTrack
 import com.example.data.LibrarySyncState
+import com.example.data.CompanionConnectionPresentation
+import com.example.data.CompanionConnectionStatus
+import com.example.data.CompanionReachability
+import com.example.data.ProductFailurePresentation
+import com.example.data.FailurePresentation
+import com.example.data.LastFmAuthorizationFailurePresentation
+import com.example.data.LastFmAuthorizationStep
 import com.example.playback.PlaybackManager
 import com.example.playback.TrackItem
 import com.example.data.HomeFeedState
 import com.example.data.BackendClientManager
+import com.example.data.BackendHomeFeedResponse
 import com.example.data.BackendHomeMapper
+import com.example.data.CompanionPairingClaimRequest
+import com.example.data.CompanionPairingPayload
+import com.example.data.QaNetworkPolicy
+import com.example.data.normalizeCompanionArtistArtworkUrl
+import com.example.data.normalizeCompanionUrl
 import com.example.sync.SyncScheduler
 import com.example.data.HomeRecommendationEngine
 import com.example.data.DailyMix
@@ -28,14 +51,21 @@ import com.example.data.SmartSearchService
 import com.example.data.AppCommand
 import com.example.data.PlaybackCommandExecutor
 import com.example.data.LastFmScrobbler
+import com.example.data.SyncDiagnosticService
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
 import android.content.Intent
 import android.net.Uri
+import androidx.core.net.toUri
 import com.example.data.toTrackItem
 import com.example.data.albumNavigationKey
+import com.example.data.effectiveAlbumArtist
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.time.Duration.Companion.milliseconds
 import androidx.work.Constraints
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
@@ -43,30 +73,69 @@ import androidx.work.WorkManager
 import androidx.work.workDataOf
 import com.example.data.TrackDownloadWorker
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
-class MusicViewModel(application: Application) : AndroidViewModel(application) {
+@OptIn(ExperimentalCoroutinesApi::class)
+class MusicViewModel @JvmOverloads constructor(
+    application: Application,
+    private val fetchCompanionHomeFeed: suspend (String, String) -> BackendHomeFeedResponse = { backendUrl, authorization ->
+        BackendClientManager.getApiService(backendUrl).getHomeFeed(authorization)
+    },
+    private val searchResultsOverride: (suspend (String) -> List<PlexMetadata>)? = null,
+    private val searchDebounceMillis: Long = 150,
+    private val loadLibraryArtistsOverride: (suspend (String) -> List<PlexMetadata>)? = null,
+    private val loadLibraryAlbumsOverride: (suspend (String) -> List<PlexMetadata>)? = null,
+    private val loadRecentlyAddedOverride: (suspend (String) -> List<PlexMetadata>)? = null,
+    private val loadLibrariesOverride: (suspend () -> List<PlexDirectory>)? = null
+) : AndroidViewModel(application) {
+    private class CompanionCredentialSaveException : IllegalStateException()
     val repository = MusicRepository(application)
     val playbackManager = PlaybackManager.getInstance(application)
+    internal var enqueueLibrarySyncForQa: (suspend (String, Boolean) -> Unit)? = null
 
     // Recommendation Engine
     private val recommendationEngine = HomeRecommendationEngine(application)
     private val radioService = RadioService()
+    private val stationRecipeStore = SavedStationRecipeStore(application)
+    private val _savedStationRecipes = MutableStateFlow(stationRecipeStore.load())
+    val savedStationRecipes: StateFlow<List<SavedStationRecipe>> = _savedStationRecipes.asStateFlow()
+    private val discoveryTuningStore = DiscoveryTuningStore(application)
+    private val _discoveryTuning = MutableStateFlow(discoveryTuningStore.load())
+    val discoveryTuning: StateFlow<DiscoveryTuning> = _discoveryTuning.asStateFlow()
     private var searchJob: Job? = null
+    private var searchGeneration = 0L
 
     // Configuration states
-    private val _isConfigured = MutableStateFlow(repository.settings.isConfigured || repository.settings.isCompanionConfigured)
+    private val _isConfigured = MutableStateFlow(repository.settings.isPlexConfigured || repository.settings.isCompanionConfigured)
     val isConfigured: StateFlow<Boolean> = _isConfigured.asStateFlow()
+
+    private val _baseUrlFlow = MutableStateFlow(repository.settings.baseUrl)
+    val baseUrlFlow: StateFlow<String> = _baseUrlFlow.asStateFlow()
+
+    private val _tokenFlow = MutableStateFlow(repository.settings.token)
+    val tokenFlow: StateFlow<String> = _tokenFlow.asStateFlow()
+
+    private val _companionUrlFlow = MutableStateFlow(repository.settings.companionBackendUrl)
+    val companionUrlFlow: StateFlow<String> = _companionUrlFlow.asStateFlow()
+
+    private val _companionTokenFlow = MutableStateFlow(repository.settings.companionBackendToken)
+    val companionTokenFlow: StateFlow<String> = _companionTokenFlow.asStateFlow()
 
     private val _libraries = MutableStateFlow<List<PlexDirectory>>(emptyList())
     val libraries: StateFlow<List<PlexDirectory>> = _libraries.asStateFlow()
+    private val _libraryLoadError = MutableStateFlow<String?>(null)
+    val libraryLoadError: StateFlow<String?> = _libraryLoadError.asStateFlow()
 
     private val _selectedSectionId = MutableStateFlow(
-        repository.settings.sectionId.ifBlank { if (repository.settings.isCompanionConfigured) "spotcore" else "" }
+        if (repository.settings.isCompanionConfigured) "spotcore"
+        else repository.settings.sectionId
     )
     val selectedSectionId: StateFlow<String> = _selectedSectionId.asStateFlow()
 
     private val _selectedLibraryName = MutableStateFlow(
-        repository.settings.libraryName.ifBlank { if (repository.settings.isCompanionConfigured) "SpotCore Library" else "" }
+        if (repository.settings.isCompanionConfigured) "SpotCore Library"
+        else repository.settings.libraryName
     )
     val selectedLibraryName: StateFlow<String> = _selectedLibraryName.asStateFlow()
 
@@ -79,6 +148,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _recentlyAddedAlbums = MutableStateFlow<List<PlexMetadata>>(emptyList())
     val recentlyAddedAlbums: StateFlow<List<PlexMetadata>> = _recentlyAddedAlbums.asStateFlow()
+    private val _isLoadingRecentlyAdded = MutableStateFlow(false)
+    val isLoadingRecentlyAdded: StateFlow<Boolean> = _isLoadingRecentlyAdded.asStateFlow()
+    private val _recentlyAddedLoadError = MutableStateFlow<String?>(null)
+    val recentlyAddedLoadError: StateFlow<String?> = _recentlyAddedLoadError.asStateFlow()
+    private var recentlyAddedLoadGeneration = 0L
 
     // Detail states
     private val _currentArtistAlbums = MutableStateFlow<List<PlexMetadata>>(emptyList())
@@ -93,14 +167,21 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private val _artistProfile = MutableStateFlow<ArtistProfile?>(null)
     val artistProfile: StateFlow<ArtistProfile?> = _artistProfile.asStateFlow()
 
+    private val _artistDetailLoadError = MutableStateFlow<String?>(null)
+    val artistDetailLoadError: StateFlow<String?> = _artistDetailLoadError.asStateFlow()
+
     private val _currentAlbumTracks = MutableStateFlow<List<PlexMetadata>>(emptyList())
     val currentAlbumTracks: StateFlow<List<PlexMetadata>> = _currentAlbumTracks.asStateFlow()
+    private val _albumDetailLoadError = MutableStateFlow<String?>(null)
+    val albumDetailLoadError: StateFlow<String?> = _albumDetailLoadError.asStateFlow()
 
     // Search results
     private val _searchResults = MutableStateFlow<List<PlexMetadata>>(emptyList())
     val searchResults: StateFlow<List<PlexMetadata>> = _searchResults.asStateFlow()
     private val _searchError = MutableStateFlow<String?>(null)
     val searchError: StateFlow<String?> = _searchError.asStateFlow()
+    private val _isSearchLoading = MutableStateFlow(false)
+    val isSearchLoading: StateFlow<Boolean> = _isSearchLoading.asStateFlow()
 
     // Local DB flows
     val recentlyPlayed: StateFlow<List<RecentTrack>> = repository.recentlyPlayed
@@ -109,15 +190,33 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     val cachedTracks: StateFlow<List<CachedTrack>> = repository.cachedTracksCount
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
+    val listeningHistory: StateFlow<List<ListeningHistoryEntity>> = repository.listeningHistory
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
     private val _cachedCount = MutableStateFlow(0)
     val cachedCount: StateFlow<Int> = _cachedCount.asStateFlow()
+    private val _cachedLibraryRevision = MutableStateFlow(0L)
+    val cachedLibraryRevision: StateFlow<Long> = _cachedLibraryRevision.asStateFlow()
+
 
     // Status states
     private val _isLoading = MutableStateFlow(false)
     val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+    private val _isLoadingArtists = MutableStateFlow(false)
+    val isLoadingArtists: StateFlow<Boolean> = _isLoadingArtists.asStateFlow()
+    private val _isLoadingAlbums = MutableStateFlow(false)
+    val isLoadingAlbums: StateFlow<Boolean> = _isLoadingAlbums.asStateFlow()
+    private val _artistLoadError = MutableStateFlow<String?>(null)
+    val artistLoadError: StateFlow<String?> = _artistLoadError.asStateFlow()
+    private val _albumLoadError = MutableStateFlow<String?>(null)
+    val albumLoadError: StateFlow<String?> = _albumLoadError.asStateFlow()
 
     private val _syncState = MutableStateFlow<LibrarySyncState>(LibrarySyncState.Idle)
     val syncState: StateFlow<LibrarySyncState> = _syncState.asStateFlow()
+    private val _isRefreshingServerLibrary = MutableStateFlow(false)
+    val isRefreshingServerLibrary: StateFlow<Boolean> = _isRefreshingServerLibrary.asStateFlow()
+
+    val syncDiagnosticInfo = SyncDiagnosticService.diagnosticInfo
 
     private val _aiLoading = MutableStateFlow(false)
     val aiLoading: StateFlow<Boolean> = _aiLoading.asStateFlow()
@@ -127,31 +226,169 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
+    private val _homeFeedFailure = MutableStateFlow<FailurePresentation?>(null)
+    val homeFeedFailure: StateFlow<FailurePresentation?> = _homeFeedFailure.asStateFlow()
+    private val _connectionErrorMessage = MutableStateFlow<String?>(null)
+    val connectionErrorMessage: StateFlow<String?> = _connectionErrorMessage.asStateFlow()
+    private val _connectionErrorTechnicalDetails = MutableStateFlow<String?>(null)
+    val connectionErrorTechnicalDetails: StateFlow<String?> = _connectionErrorTechnicalDetails.asStateFlow()
     private val _companionRevision = MutableStateFlow(0)
+    private val companionReachabilityGeneration = AtomicLong(0)
     private val _companionConfigured = MutableStateFlow(repository.settings.isCompanionConfigured)
     val companionConfigured: StateFlow<Boolean> = _companionConfigured.asStateFlow()
+    private var companionReachabilityCheckJob: Job? = null
+    private val _companionReachability = MutableStateFlow(
+        if (repository.settings.isCompanionConfigured) CompanionReachability.CHECKING
+        else CompanionReachability.UNKNOWN
+    )
+    val companionReachability: StateFlow<CompanionReachability> = _companionReachability.asStateFlow()
+    internal enum class ReachabilityProbePhase { IDLE, RUNNING, SUCCEEDED, FAILED, CANCELLED }
+    private val _reachabilityProbePhase = MutableStateFlow(ReachabilityProbePhase.IDLE)
+    internal val reachabilityProbePhase: StateFlow<ReachabilityProbePhase> = _reachabilityProbePhase.asStateFlow()
+    private val _companionConnectionStatus = MutableStateFlow(
+        CompanionConnectionPresentation.resolve(
+            repository.settings.isCompanionConfigured,
+            _companionReachability.value,
+            _cachedCount.value
+        )
+    )
+    val companionConnectionStatus: StateFlow<CompanionConnectionStatus> = _companionConnectionStatus.asStateFlow()
 
-    // Combined Reactive Home Feed State Flow
+    private fun updateCompanionConnectionStatus() {
+        _companionConnectionStatus.value = CompanionConnectionPresentation.resolve(
+            _companionConfigured.value,
+            _companionReachability.value,
+            _cachedCount.value
+        )
+    }
+
+    /** Re-run the reactive Home feed after a transient backend failure. */
+    fun retryHomeFeed() {
+        clearHomeFeedFailure()
+        clearConnectionFailure()
+        _companionReachability.value = CompanionReachability.CHECKING
+        updateCompanionConnectionStatus()
+        companionReachabilityGeneration.incrementAndGet()
+        _companionRevision.value++
+    }
+
+    /** Explicitly recheck a saved SpotCore connection from Settings recovery. */
+    fun retryCompanionConnection() {
+        if (!_companionConfigured.value) return
+        _companionReachability.value = CompanionReachability.CHECKING
+        updateCompanionConnectionStatus()
+        clearConnectionFailure()
+        val requestGeneration = companionReachabilityGeneration.incrementAndGet()
+        companionReachabilityCheckJob?.cancel()
+        companionReachabilityCheckJob = viewModelScope.launch(Dispatchers.IO) {
+            checkCompanionReachability(requestGeneration)
+        }
+    }
+
+    /**
+     * Settings can be the restored entry route, in which case Home's feed is not
+     * collected and cannot update the initial CHECKING state. Subscribe to that
+     * shared request only until the first reachability result is known.
+     */
+    fun ensureCompanionReachabilityChecked() {
+        if (!_companionConfigured.value || _companionReachability.value != CompanionReachability.CHECKING) return
+        if (companionReachabilityCheckJob?.isActive == true) return
+        val requestGeneration = companionReachabilityGeneration.incrementAndGet()
+        companionReachabilityCheckJob = viewModelScope.launch(Dispatchers.IO) {
+            checkCompanionReachability(requestGeneration)
+        }
+    }
+
+    private suspend fun checkCompanionReachability(requestGeneration: Long) {
+        if (!_companionConfigured.value) return
+        _reachabilityProbePhase.value = ReachabilityProbePhase.RUNNING
+        val settings = repository.settings
+        try {
+            val response = BackendClientManager
+                .getApiService(settings.companionBackendUrl)
+                .checkHomeFeedReachability(
+                    userAuthToken = "Bearer ${settings.companionBackendToken}",
+                    reachabilityCheck = "true"
+                )
+                .execute()
+            if (!response.isSuccessful) {
+                val failure = retrofit2.HttpException(response)
+                response.errorBody()?.close()
+                throw failure
+            }
+            if (requestGeneration == companionReachabilityGeneration.get()) {
+                _reachabilityProbePhase.value = ReachabilityProbePhase.SUCCEEDED
+                _companionReachability.value = CompanionReachability.AVAILABLE
+                updateCompanionConnectionStatus()
+                clearConnectionFailure()
+            }
+            response.body()?.close()
+        } catch (cancellation: CancellationException) {
+            _reachabilityProbePhase.value = ReachabilityProbePhase.CANCELLED
+            throw cancellation
+        } catch (error: Exception) {
+            if (requestGeneration == companionReachabilityGeneration.get()) {
+                _reachabilityProbePhase.value = ReachabilityProbePhase.FAILED
+                _companionReachability.value = CompanionReachability.UNAVAILABLE
+                updateCompanionConnectionStatus()
+                setConnectionFailure(ProductFailurePresentation.from(
+                    getApplication<Application>(),
+                    error,
+                    fallback = getApplication<Application>().getString(R.string.product_failure_refresh_library)
+                ))
+            }
+        }
+    }
+
+    // Combined Reactive Home Feed State Flow. When SpotCore is configured,
+    // Home is server-authoritative; Room recommendations are only a fallback
+    // for an unavailable companion request.
     val homeFeedState: StateFlow<HomeFeedState> = combine(
         recentlyAddedAlbums,
         recentlyPlayed,
         cachedTracks,
         _companionRevision
     ) { recentAdded, history, _, _ ->
-        recommendationEngine.generateHomeFeed(recentAdded, history)
-    }.map { plexFeed ->
         val settings = repository.settings
         if (!settings.isCompanionConfigured) {
-            plexFeed
+            _companionReachability.value = CompanionReachability.UNKNOWN
+            updateCompanionConnectionStatus()
+            recommendationEngine.generateHomeFeed(recentAdded, history)
         } else {
-            runCatching {
-                val response = BackendClientManager
-                    .getApiService(settings.companionBackendUrl)
-                    .getHomeFeed("Bearer ${settings.companionBackendToken}")
-                BackendHomeMapper.merge(response, plexFeed)
-            }.onFailure { error ->
-                Log.w("MusicViewModel", "SpotCore Home unavailable; using Plex fallback", error)
-            }.getOrDefault(plexFeed)
+            val requestGeneration = companionReachabilityGeneration.incrementAndGet()
+            try {
+                val response = fetchCompanionHomeFeed(
+                    settings.companionBackendUrl,
+                    "Bearer ${settings.companionBackendToken}"
+                )
+                if (requestGeneration == companionReachabilityGeneration.get()) {
+                    _companionReachability.value = CompanionReachability.AVAILABLE
+                    updateCompanionConnectionStatus()
+                    clearConnectionFailure()
+                    clearHomeFeedFailure()
+                }
+                BackendHomeMapper.merge(
+                    response,
+                    HomeFeedState(),
+                    artworkBaseUrl = settings.companionBackendUrl
+                )
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: Exception) {
+                if (requestGeneration == companionReachabilityGeneration.get()) {
+                    _companionReachability.value = CompanionReachability.UNAVAILABLE
+                    updateCompanionConnectionStatus()
+                    val failure = ProductFailurePresentation.from(
+                        getApplication<Application>(),
+                        error,
+                        fallback = getApplication<Application>().getString(R.string.product_failure_refresh_library)
+                    )
+                    setConnectionFailure(failure)
+                    _homeFeedFailure.value = failure
+                }
+                Log.w("MusicViewModel", "SpotCore Home unavailable; using saved recommendations (${error::class.simpleName})")
+                recommendationEngine.generateHomeFeed(recentAdded, history)
+            }
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), HomeFeedState())
 
@@ -159,7 +396,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     val playlists: StateFlow<List<com.example.data.PlaylistEntity>> = repository.playlists
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    val downloadedTracks: StateFlow<List<com.example.data.DownloadedTrackEntity>> = repository.downloadedTracks
+    val downloadedTracksSnapshot: StateFlow<List<DownloadedTrackEntity>?> = repository.downloadedTracks
+        .map<List<DownloadedTrackEntity>, List<DownloadedTrackEntity>?> { it }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), null)
+
+    val downloadedTracks: StateFlow<List<DownloadedTrackEntity>> = downloadedTracksSnapshot
+        .filterNotNull()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val likedTracks: StateFlow<List<com.example.data.LikedTrackEntity>> = repository.likedTracks
@@ -202,6 +444,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _lastFmSessionKeyFlow = MutableStateFlow(repository.settings.lastFmSessionKey)
     val lastFmSessionKeyFlow: StateFlow<String> = _lastFmSessionKeyFlow.asStateFlow()
+    private val _lastFmAuthorizationPendingFlow = MutableStateFlow(repository.settings.lastFmPendingToken.isNotBlank())
+    val lastFmAuthorizationPendingFlow: StateFlow<Boolean> = _lastFmAuthorizationPendingFlow.asStateFlow()
     private val _lastFmApiKeyFlow = MutableStateFlow(repository.settings.lastFmApiKey)
     val lastFmApiKeyFlow: StateFlow<String> = _lastFmApiKeyFlow.asStateFlow()
     private val _lastFmApiSecretFlow = MutableStateFlow(repository.settings.lastFmApiSecret)
@@ -214,6 +458,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     val lastFmPrivateFlow: StateFlow<Boolean> = _lastFmPrivateFlow.asStateFlow()
     private val _lastFmAuthMessage = MutableStateFlow("")
     val lastFmAuthMessage: StateFlow<String> = _lastFmAuthMessage.asStateFlow()
+    private val _lastFmAuthFailed = MutableStateFlow(false)
+    val lastFmAuthFailed: StateFlow<Boolean> = _lastFmAuthFailed.asStateFlow()
 
     private val _syncIntervalHoursFlow = MutableStateFlow(repository.settings.syncIntervalHours)
     val syncIntervalHoursFlow: StateFlow<Long> = _syncIntervalHoursFlow.asStateFlow()
@@ -240,6 +486,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         repository.settings.equalizerEnabled = enabled
         _equalizerEnabledFlow.value = enabled
         playbackManager.refreshAudioSettings()
+    }
+
+    fun updateGaplessEnabled(enabled: Boolean) {
+        repository.settings.gaplessEnabled = enabled
+        _gaplessEnabledFlow.value = enabled
+        playbackManager.setGaplessPlaybackEnabled(enabled)
     }
 
     fun updateEqualizerPreset(presetName: String) {
@@ -279,9 +531,50 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun triggerServerRescan() {
+        if (_isRefreshingServerLibrary.value) return
+        _isRefreshingServerLibrary.value = true
+        viewModelScope.launch {
+            _isLoading.value = true
+            _errorMessage.value = null
+            clearConnectionFailure()
+            _companionReachability.value = CompanionReachability.CHECKING
+            updateCompanionConnectionStatus()
+            try {
+                Log.d("MusicViewModel", "Triggering SpotCore library refresh")
+                repository.scanServerLibrary()
+            } catch (e: Exception) {
+                Log.e("MusicViewModel", "Error refreshing SpotCore library (${e::class.simpleName})")
+                _companionReachability.value = CompanionReachability.UNAVAILABLE
+                updateCompanionConnectionStatus()
+                val failure = ProductFailurePresentation.from(
+                    getApplication<Application>(),
+                    e,
+                    fallback = getApplication<Application>().getString(R.string.product_failure_refresh_library)
+                )
+                setConnectionFailure(failure)
+                _errorMessage.value = failure.message
+                _isLoading.value = false
+                _isRefreshingServerLibrary.value = false
+                return@launch
+            }
+
+            _companionReachability.value = CompanionReachability.AVAILABLE
+            updateCompanionConnectionStatus()
+            clearConnectionFailure()
+            enqueueLibrarySyncSafely(
+                "spotcore",
+                restart = true,
+                fallback = getApplication<Application>().getString(R.string.product_failure_sync_start_failed)
+            )
+            _isLoading.value = false
+            _isRefreshingServerLibrary.value = false
+        }
+    }
+
     fun playTrackFromCache(track: CachedTrack) {
         viewModelScope.launch {
-            val trackItem = com.example.playback.TrackItem(
+            val trackItem = TrackItem(
                 ratingKey = track.ratingKey,
                 title = track.title,
                 artist = track.artist,
@@ -289,7 +582,8 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 key = track.key,
                 thumb = track.thumb,
                 duration = track.duration,
-                albumRatingKey = albumNavigationKey(track.artist, track.album)
+                albumRatingKey = albumNavigationKey(effectiveAlbumArtist(track.albumArtist, track.artist), track.album),
+                albumArtist = effectiveAlbumArtist(track.albumArtist, track.artist)
             )
             playbackManager.playTrack(trackItem, emptyList())
         }
@@ -305,17 +599,49 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setCompanionFavorite(trackId: String, favorite: Boolean) {
+        viewModelScope.launch {
+            runCatching { repository.setCompanionFavorite(trackId, favorite) }
+                .onFailure { error ->
+                    Log.w("MusicViewModel", "SpotCore favorite could not be queued (${error::class.simpleName})")
+                    postErrorMessage(getApplication<Application>().getString(R.string.library_spotcore_state_save_failed))
+                }
+        }
+    }
+
+    fun setCompanionRating(trackId: String, rating: Int) {
+        viewModelScope.launch {
+            runCatching { repository.setCompanionRating(trackId, rating) }
+                .onFailure { error ->
+                    Log.w("MusicViewModel", "SpotCore rating could not be queued (${error::class.simpleName})")
+                    postErrorMessage(getApplication<Application>().getString(R.string.library_spotcore_state_save_failed))
+                }
+        }
+    }
+
     fun isTrackLikedFlow(ratingKey: String): Flow<Boolean> {
         return repository.isTrackLikedFlow(ratingKey)
     }
 
-    fun savePlaylistWithTracks(name: String, tracks: List<TrackItem>, onSaved: (() -> Unit)? = null) {
+    fun savePlaylistWithTracks(
+        name: String,
+        tracks: List<TrackItem>,
+        onSaved: (() -> Unit)? = null,
+        onFailure: (() -> Unit)? = null
+    ) {
         viewModelScope.launch {
-            val id = repository.createPlaylist(name)
-            tracks.forEach { track ->
-                repository.addTrackToPlaylist(id.toInt(), track)
+            try {
+                val id = repository.createPlaylist(name)
+                tracks.forEach { track ->
+                    repository.addTrackToPlaylist(id.toInt(), track)
+                }
+                onSaved?.invoke()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.w("MusicViewModel", "Could not save playlist with tracks (${error::class.simpleName})")
+                onFailure?.invoke()
             }
-            onSaved?.invoke()
         }
     }
 
@@ -325,16 +651,69 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun createPlaylist(name: String, onCreated: ((Long) -> Unit)? = null) {
+    fun downloadPlaylist(playlistId: Int) {
         viewModelScope.launch {
-            val id = repository.createPlaylist(name)
-            onCreated?.invoke(id)
+            repository.getPlaylistTracksList(playlistId).forEach { startDownload(it.toTrackItem()) }
         }
     }
 
-    fun deletePlaylist(playlistId: Int) {
+    fun createPlaylist(
+        name: String,
+        onFailure: (() -> Unit)? = null,
+        onCreated: ((Long) -> Unit)? = null
+    ) {
         viewModelScope.launch {
-            repository.deletePlaylist(playlistId)
+            try {
+                val id = repository.createPlaylist(name)
+                onCreated?.invoke(id)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.w("MusicViewModel", "Could not save playlist (${error::class.simpleName})")
+                onFailure?.invoke()
+            }
+        }
+    }
+
+    fun sharePlaylist(playlistId: Int) {
+        viewModelScope.launch {
+            if (repository.sharePlaylist(playlistId)) repository.enqueuePlaylistSync()
+        }
+    }
+
+    fun refreshSharedPlaylist(playlistId: Int) {
+        viewModelScope.launch {
+            repository.refreshSharedPlaylist(playlistId)
+        }
+    }
+
+    fun keepLocalPlaylistChangesAfterConflict(playlistId: Int) {
+        viewModelScope.launch {
+            repository.keepLocalPlaylistChangesAfterConflict(playlistId)
+        }
+    }
+
+    fun renamePlaylist(playlistId: Int, name: String) {
+        viewModelScope.launch {
+            repository.renamePlaylist(playlistId, name)
+        }
+    }
+
+    fun deletePlaylist(
+        playlistId: Int,
+        onDeleted: (() -> Unit)? = null,
+        onFailure: (() -> Unit)? = null
+    ) {
+        viewModelScope.launch {
+            try {
+                if (repository.deletePlaylist(playlistId)) onDeleted?.invoke()
+                else onFailure?.invoke()
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Log.w("MusicViewModel", "Could not delete playlist (${error::class.simpleName})")
+                onFailure?.invoke()
+            }
         }
     }
 
@@ -382,29 +761,44 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun reorderPlaylistTracks(tracks: List<com.example.data.PlaylistTrackEntity>) {
+        viewModelScope.launch { repository.reorderPlaylistTracks(tracks) }
+    }
+
     fun startDownload(track: TrackItem) {
         viewModelScope.launch {
-            if (repository.isTrackDownloaded(track.ratingKey)) return@launch
-            repository.queueDownload(track)
-            val request = OneTimeWorkRequestBuilder<TrackDownloadWorker>()
-                .addTag("spotamp_download")
-                .setInputData(workDataOf(
-                    TrackDownloadWorker.KEY_RATING_KEY to track.ratingKey,
-                    TrackDownloadWorker.KEY_TITLE to track.title,
-                    TrackDownloadWorker.KEY_ARTIST to track.artist,
-                    TrackDownloadWorker.KEY_ALBUM to track.album,
-                    TrackDownloadWorker.KEY_KEY to track.key,
-                    TrackDownloadWorker.KEY_THUMB to track.thumb,
-                    TrackDownloadWorker.KEY_DURATION to track.duration
-                ))
-                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
-                .setBackoffCriteria(androidx.work.BackoffPolicy.EXPONENTIAL, 10, TimeUnit.SECONDS)
-                .build()
-            WorkManager.getInstance(getApplication()).enqueueUniqueWork(
-                "download_${track.ratingKey}",
-                androidx.work.ExistingWorkPolicy.KEEP,
-                request
-            )
+            try {
+                // Serialize the terminal/active status check with the queue row write. This
+                // covers rapid taps and overlapping album/playlist download requests.
+                if (!repository.queueDownload(track)) return@launch
+                val request = OneTimeWorkRequestBuilder<TrackDownloadWorker>()
+                    .addTag(TrackDownloadWorker.DOWNLOAD_TAG)
+                    .addTag(TrackDownloadWorker.TRACK_TAG_PREFIX + track.ratingKey)
+                    .setInputData(workDataOf(
+                        TrackDownloadWorker.KEY_RATING_KEY to track.ratingKey,
+                        TrackDownloadWorker.KEY_TITLE to track.title,
+                        TrackDownloadWorker.KEY_ARTIST to track.artist,
+                        TrackDownloadWorker.KEY_ALBUM to track.album,
+                        TrackDownloadWorker.KEY_KEY to track.key,
+                        TrackDownloadWorker.KEY_THUMB to track.thumb,
+                        TrackDownloadWorker.KEY_DURATION to track.duration
+                    ))
+                    .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+                    .setBackoffCriteria(androidx.work.BackoffPolicy.EXPONENTIAL, 10, TimeUnit.SECONDS)
+                    .build()
+                WorkManager.getInstance(getApplication()).enqueueUniqueWork(
+                    "download_${track.ratingKey}",
+                    androidx.work.ExistingWorkPolicy.KEEP,
+                    request
+                )
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: Exception) {
+                runCatching {
+                    repository.markDownloadStatus(track.ratingKey, "failed", error.localizedMessage)
+                }
+                Log.w("MusicViewModel", "Could not queue download (${error::class.simpleName})")
+            }
         }
     }
 
@@ -448,7 +842,15 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun retryDownload(track: com.example.data.DownloadedTrackEntity) {
-        startDownload(track.toTrackItem())
+        viewModelScope.launch {
+            // A completed DB row can outlive its file (for example after
+            // storage cleanup). Remove that stale row so startDownload is not
+            // blocked by the completed-record guard.
+            if (track.status == "completed") {
+                repository.deleteDownloadedTrack(track.ratingKey)
+            }
+            startDownload(track.toTrackItem())
+        }
     }
 
     fun deleteAllDownloads() {
@@ -459,8 +861,37 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     init {
-        playbackManager.setMusicDao(com.example.data.MusicDatabase.getDatabase(application).musicDao())
+        viewModelScope.launch {
+            val workManager = runCatching { WorkManager.getInstance(getApplication()) }
+                .onFailure { Log.w("MusicViewModel", "Download progress monitoring is unavailable (${it::class.simpleName})") }
+                .getOrNull()
+                ?: return@launch
+            workManager.getWorkInfosByTagFlow(TrackDownloadWorker.DOWNLOAD_TAG)
+                .collect { workInfos ->
+                    _downloadProgresses.value = buildMap {
+                        workInfos.forEach { workInfo ->
+                            if (workInfo.state != androidx.work.WorkInfo.State.RUNNING) return@forEach
+                            val ratingKey = workInfo.tags.asSequence()
+                                .firstOrNull { it.startsWith(TrackDownloadWorker.TRACK_TAG_PREFIX) }
+                                ?.removePrefix(TrackDownloadWorker.TRACK_TAG_PREFIX)
+                                ?.takeIf(String::isNotBlank)
+                                ?: return@forEach
+                            put(
+                                ratingKey,
+                                workInfo.progress.getFloat(TrackDownloadWorker.KEY_PROGRESS, -1f)
+                            )
+                        }
+                    }
+                }
+        }
+
+        if (BuildConfig.QA_BUILD) {
+            repository.settings.companionBackendUrl
+                .toHttpUrlOrNull()
+                ?.let(QaNetworkPolicy::allowExplicitCompanionOrigin)
+        }
         updatePlaybackCredentials()
+        playbackManager.setMusicDao(com.example.data.MusicDatabase.getDatabase(application).musicDao())
         loadCachedCount()
         
         // Schedule background sync if enabled
@@ -476,21 +907,72 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             loadInitialLibraryData()
         }
 
+        // Older cache rows can contain relative, desktop-only, or blank
+        // artwork references. Queue one refresh so the authoritative SpotCore
+        // contract replaces them with authenticated companion URLs.
+        if (repository.settings.isCompanionConfigured) {
+            repository.enqueuePlaylistSync()
+            viewModelScope.launch {
+                if (repository.hasNonCanonicalCacheRows()) {
+                    repository.startSync("spotcore", restart = true)
+                }
+            }
+        }
+
         viewModelScope.launch {
+            var activeCompanionSyncId: Long? = null
+            var activeCompanionSyncGeneration: Long? = null
             _selectedSectionId
                 .flatMapLatest { sectionId ->
+                    if (sectionId != "spotcore") {
+                        activeCompanionSyncId = null
+                        activeCompanionSyncGeneration = null
+                    }
                     if (sectionId.isEmpty()) flowOf(null)
                     else repository.getSyncStateFlow(sectionId)
                 }
                 .collect { entity ->
                     _syncState.value = when (entity?.status) {
-                        "running" -> LibrarySyncState.Processing(entity.currentOffset, entity.totalTracks, 0)
+                        "running" -> if (entity.currentOffset == 0) {
+                            LibrarySyncState.Connecting
+                        } else {
+                            LibrarySyncState.Processing(entity.currentOffset, entity.totalTracks, 0)
+                        }
                         "completed" -> {
                             loadInitialLibraryData()
                             LibrarySyncState.Complete(entity.totalTracks, 0, 0)
                         }
                         "failed" -> LibrarySyncState.Failed("Sync failed", entity.lastError ?: "Unknown", "Indexing")
                         else -> LibrarySyncState.Idle
+                    }
+                    when (entity?.status) {
+                        "running" -> {
+                            activeCompanionSyncId = entity.lastSyncId
+                            activeCompanionSyncGeneration = companionReachabilityGeneration.get()
+                        }
+                        "completed" -> {
+                            // Room replays the last sync row when Settings or Home
+                            // subscribes. A historical completion is not proof that
+                            // SpotCore is reachable now; only accept a completion
+                            // observed after this ViewModel saw that run start.
+                            val completedActiveRun = activeCompanionSyncId == entity.lastSyncId &&
+                                activeCompanionSyncGeneration == companionReachabilityGeneration.get()
+                            activeCompanionSyncId = null
+                            activeCompanionSyncGeneration = null
+                            if (completedActiveRun && repository.settings.isCompanionConfigured) {
+                                _companionReachability.value = CompanionReachability.AVAILABLE
+                                updateCompanionConnectionStatus()
+                                clearConnectionFailure()
+                            }
+                        }
+                        "failed" -> {
+                            activeCompanionSyncId = null
+                            activeCompanionSyncGeneration = null
+                        }
+                        else -> if (entity == null) {
+                            activeCompanionSyncId = null
+                            activeCompanionSyncGeneration = null
+                        }
                     }
                 }
         }
@@ -505,9 +987,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         repository.settings.baseUrl = baseUrl.trim()
         repository.settings.token = token.trim()
         repository.settings.lyricsDirectory = lyricsDirectory.trim()
-        _isConfigured.value = repository.settings.isConfigured || repository.settings.isCompanionConfigured
+        _baseUrlFlow.value = baseUrl.trim()
+        _tokenFlow.value = token.trim()
+        _isConfigured.value = repository.settings.isPlexConfigured || repository.settings.isCompanionConfigured
         updatePlaybackCredentials()
-        if (repository.settings.isConfigured) {
+        if (repository.settings.isPlexConfigured) {
             loadLibraries()
         }
     }
@@ -519,43 +1003,117 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     fun updateLastFmPrivate(value: Boolean) { repository.settings.lastFmPrivateSession = value; _lastFmPrivateFlow.value = value }
     fun disconnectLastFm() {
         repository.settings.lastFmEnabled = false; repository.settings.lastFmUsername = ""; repository.settings.lastFmSessionKey = ""
+        repository.settings.lastFmPendingToken = ""
         _lastFmEnabledFlow.value = false; _lastFmUsernameFlow.value = ""; _lastFmSessionKeyFlow.value = ""
+        _lastFmAuthorizationPendingFlow.value = false
+        _lastFmAuthFailed.value = false
         _lastFmAuthMessage.value = "Disconnected"
     }
     fun startLastFmAuthorization() {
         viewModelScope.launch {
+            _lastFmAuthFailed.value = false
+            _lastFmAuthMessage.value = ""
             LastFmScrobbler.requestToken(repository.settings).onSuccess {
-                LastFmScrobbler.authorizationUrl(repository.settings)?.let { getApplication<Application>().startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(it)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+                _lastFmAuthorizationPendingFlow.value = repository.settings.lastFmPendingToken.isNotBlank()
+                LastFmScrobbler.authorizationUrl(repository.settings)?.let { getApplication<Application>().startActivity(Intent(Intent.ACTION_VIEW, it.toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
                 _lastFmAuthMessage.value = "Approve SpotAmp in your browser, then tap Complete auth."
-            }.onFailure { _lastFmAuthMessage.value = it.message ?: "Authorization failed" }
+            }.onFailure {
+                _lastFmAuthFailed.value = true
+                _lastFmAuthMessage.value = LastFmAuthorizationFailurePresentation.message(
+                    getApplication(),
+                    LastFmAuthorizationStep.START
+                )
+            }
         }
     }
     fun completeLastFmAuthorization() {
         viewModelScope.launch {
+            _lastFmAuthFailed.value = false
+            _lastFmAuthMessage.value = ""
             LastFmScrobbler.completeAuthorization(repository.settings).onSuccess { name ->
                 _lastFmEnabledFlow.value = true; _lastFmUsernameFlow.value = name; _lastFmSessionKeyFlow.value = repository.settings.lastFmSessionKey
+                _lastFmAuthorizationPendingFlow.value = false
                 _lastFmAuthMessage.value = "Connected as $name"
-            }.onFailure { _lastFmAuthMessage.value = it.message ?: "Authorization failed" }
+            }.onFailure {
+                _lastFmAuthFailed.value = true
+                _lastFmAuthMessage.value = LastFmAuthorizationFailurePresentation.message(
+                    getApplication(),
+                    LastFmAuthorizationStep.COMPLETE
+                )
+            }
         }
     }
 
-    fun saveCompanionBackend(url: String, token: String) {
-        val normalizedUrl = url.trim().trimEnd('/')
+    fun disconnectCompanion() {
+        val backendUrl = repository.settings.companionBackendUrl
+        val token = repository.settings.companionBackendToken
+        viewModelScope.launch {
+            val revoked = if (backendUrl.isNotBlank() && token.isNotBlank()) {
+                runCatching {
+                    BackendClientManager.getApiService(backendUrl)
+                        .revokePairing("Bearer $token")
+                        .revoked
+                }.getOrDefault(false)
+            } else {
+                true
+            }
+            saveCompanionBackend("", "")
+            if (!revoked) {
+                postErrorMessage(getApplication<Application>().getString(R.string.connection_disconnect_revoke_failed))
+            }
+        }
+    }
+    fun saveCompanionBackend(url: String, token: String, deviceId: String = ""): Boolean {
+        val normalizedUrl = runCatching { normalizeCompanionUrl(url, allowPrivateHttp = true) }
+            .getOrElse {
+                if (url.isBlank() && token.isBlank()) "" else {
+                    postErrorMessage(getApplication<Application>().getString(companionUrlErrorResource(it.message)))
+                    return false
+                }
+            }
         val normalizedToken = token.trim()
         if ((normalizedUrl.isBlank()) != (normalizedToken.isBlank())) {
-            postErrorMessage("Enter both the SpotCore URL and token, or clear both fields.")
-            return
+            postErrorMessage(getApplication<Application>().getString(R.string.settings_spotcore_credentials_incomplete))
+            return false
         }
-        repository.settings.companionBackendUrl = normalizedUrl
-        repository.settings.companionBackendToken = normalizedToken
+        if (normalizedUrl.isBlank()) {
+            repository.settings.clearCompanionCredential()
+        } else {
+            try {
+                repository.settings.saveCompanionCredential(normalizedUrl, deviceId, normalizedToken)
+            } catch (_: Exception) {
+                postErrorMessage(getApplication<Application>().getString(R.string.settings_spotcore_credentials_save_failed))
+                return false
+            }
+        }
+        companionReachabilityGeneration.incrementAndGet()
+        _companionUrlFlow.value = normalizedUrl
+        _companionTokenFlow.value = normalizedToken
         playbackManager.setCompanionToken(normalizedToken)
         _companionConfigured.value = repository.settings.isCompanionConfigured
-        _isConfigured.value = repository.settings.isConfigured || repository.settings.isCompanionConfigured
-        if (repository.settings.isCompanionConfigured && repository.settings.sectionId.isBlank()) {
+        if (repository.settings.isCompanionConfigured) repository.enqueueCompanionTrackStateSync()
+        updateCompanionConnectionStatus()
+        clearConnectionFailure()
+        clearHomeFeedFailure()
+        _libraryLoadError.value = null
+        _companionReachability.value = if (repository.settings.isCompanionConfigured) {
+            CompanionReachability.CHECKING
+        } else {
+            CompanionReachability.UNKNOWN
+        }
+        companionReachabilityCheckJob?.cancel()
+        companionReachabilityCheckJob = null
+        updateCompanionConnectionStatus()
+        _isConfigured.value = repository.settings.isPlexConfigured || repository.settings.isCompanionConfigured
+        // sectionId falls back to "spotcore" as soon as credentials are saved,
+        // so use the ViewModel's pre-existing selection to detect first pairing.
+        if (repository.settings.isCompanionConfigured && _selectedSectionId.value.isBlank()) {
+            repository.settings.sectionId = "spotcore"
+            repository.settings.libraryName = "SpotCore Library"
             _selectedSectionId.value = "spotcore"
             _selectedLibraryName.value = "SpotCore Library"
             loadInitialLibraryData()
-        } else if (!repository.settings.isConfigured && !repository.settings.isCompanionConfigured && _selectedSectionId.value == "spotcore") {
+        } else if (!repository.settings.isPlexConfigured && !repository.settings.isCompanionConfigured && _selectedSectionId.value == "spotcore") {
             repository.settings.sectionId = ""
             repository.settings.libraryName = ""
             _selectedSectionId.value = ""
@@ -564,12 +1122,78 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             _artists.value = emptyList()
             _albums.value = emptyList()
             _recentlyAddedAlbums.value = emptyList()
+            _recentlyAddedLoadError.value = null
+            _isLoadingRecentlyAdded.value = false
+            recentlyAddedLoadGeneration++
         }
+        if (repository.settings.isCompanionConfigured) repository.enqueuePlaylistSync()
         _companionRevision.value += 1
+        if (repository.settings.isCompanionConfigured) ensureCompanionReachabilityChecked()
         clearErrorMessage()
+        return true
+    }
+
+    fun claimCompanionPairing(
+        payload: CompanionPairingPayload,
+        deviceName: String,
+        onSuccess: () -> Unit = {},
+        onFailure: (String) -> Unit = {}
+    ) {
+        val cleanName = deviceName.trim().ifBlank { "SpotAmp" }.take(80)
+        viewModelScope.launch {
+            val claimResult = runCatching {
+                payload.baseUrl.toHttpUrlOrNull()?.let(QaNetworkPolicy::allowExplicitCompanionOrigin)
+                val response = BackendClientManager
+                    .getApiService(payload.baseUrl)
+                    .claimPairing(
+                        CompanionPairingClaimRequest(
+                            pairingId = payload.pairingId,
+                            secret = payload.secret,
+                            deviceName = cleanName
+                        )
+                    )
+                if (!saveCompanionBackend(payload.baseUrl, response.deviceToken, response.device.id)) {
+                    throw CompanionCredentialSaveException()
+                }
+            }
+            claimResult.onSuccess {
+                // A QR claim establishes the companion identity; immediately
+                // build the app's local SpotCore index so Home/search/playback
+                // use the newly paired library rather than an empty cache.
+                runCatching { repository.startSync("spotcore", restart = true) }
+                    .onFailure { error ->
+                        val message = ProductFailurePresentation.from(
+                            getApplication<Application>(),
+                            error,
+                            fallback = getApplication<Application>().getString(R.string.product_failure_pairing_sync_start_failed)
+                    ).message
+                        _libraryLoadError.value = message
+                        _errorMessage.value = message
+                    }
+                onSuccess()
+            }.onFailure { error ->
+                val message = if (error is CompanionCredentialSaveException) {
+                    getApplication<Application>().getString(R.string.pairing_credentials_save_failed)
+                } else {
+                    ProductFailurePresentation.pairing(
+                        getApplication<Application>(),
+                        error,
+                        fallback = getApplication<Application>().getString(R.string.product_failure_pairing_generic)
+                    ).message
+                }
+                postErrorMessage(message)
+                onFailure(message)
+            }
+        }
     }
 
     fun selectLibrary(sectionId: String, name: String) {
+        if (_selectedSectionId.value != sectionId) {
+            recentlyAddedLoadGeneration++
+            _recentlyAddedAlbums.value = emptyList()
+            _recentlyAddedLoadError.value = null
+            _isLoadingRecentlyAdded.value = false
+        }
         repository.settings.sectionId = sectionId
         repository.settings.libraryName = name
         _selectedSectionId.value = sectionId
@@ -578,6 +1202,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun loadInitialLibraryData() {
+        _recentlyAddedLoadError.value = null
         loadArtists()
         loadAlbums()
         loadRecentlyAdded()
@@ -585,8 +1210,12 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun loadCachedCount() {
+        // This is also the library-review refresh signal. Track tags can change
+        // during a sync without changing the number of cached tracks.
+        _cachedLibraryRevision.value += 1
         viewModelScope.launch {
             _cachedCount.value = repository.getCachedCount()
+            updateCompanionConnectionStatus()
         }
     }
 
@@ -594,25 +1223,40 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _isLoading.value = true
             _errorMessage.value = null
+            _libraryLoadError.value = null
             try {
-                if (!repository.settings.isConfigured && repository.settings.isCompanionConfigured) {
+                if (repository.settings.isCompanionConfigured) {
                     _libraries.value = listOf(PlexDirectory("spotcore", "SpotCore Library", "music"))
-                    if (_selectedSectionId.value.isBlank()) selectLibrary("spotcore", "SpotCore Library")
+                    if (_selectedSectionId.value.isBlank() || _selectedSectionId.value != "spotcore") {
+                        selectLibrary("spotcore", "SpotCore Library")
+                    }
                     return@launch
                 }
-                val list = repository.getLibraries()
+                if (!repository.settings.isPlexConfigured) {
+                    val message = "Connect SpotCore in Settings to continue."
+                    _libraryLoadError.value = message
+                    _errorMessage.value = message
+                    return@launch
+                }
+                val list = loadLibrariesOverride?.invoke() ?: repository.getLibraries()
                 _libraries.value = list
-                if (list.isEmpty() && repository.settings.isConfigured) {
-                    val backendName = if (repository.settings.isCompanionConfigured) "SpotCore" else "Plex"
-                    _errorMessage.value = "No music libraries found on $backendName."
-                } else if (list.isNotEmpty() && repository.settings.sectionId.isEmpty()) {
+                if (list.isNotEmpty() && repository.settings.sectionId.isEmpty()) {
                     // Auto-select the first available music library section
                     val firstLib = list.first()
                     selectLibrary(firstLib.key, firstLib.title)
                 }
             } catch (e: Exception) {
-                val backendName = if (repository.settings.isCompanionConfigured) "SpotCore" else "Plex"
-                _errorMessage.value = "Could not reach $backendName: ${e.localizedMessage}"
+                val message = ProductFailurePresentation.from(
+                    getApplication<Application>(),
+                    e,
+                    fallback = getApplication<Application>().getString(R.string.product_failure_load_library)
+                ).message
+                _libraryLoadError.value = message
+                _errorMessage.value = message
+                if (repository.settings.isCompanionConfigured) {
+                    _companionReachability.value = CompanionReachability.UNAVAILABLE
+                    updateCompanionConnectionStatus()
+                }
             } finally {
                 _isLoading.value = false
             }
@@ -623,13 +1267,21 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val section = _selectedSectionId.value
         if (section.isEmpty()) return
         viewModelScope.launch {
-            _isLoading.value = true
+            _isLoadingArtists.value = true
+            _artistLoadError.value = null
             try {
-                _artists.value = repository.getArtists(section)
+                _artists.value = loadLibraryArtistsOverride?.invoke(section) ?: repository.getArtists(section)
+            } catch (cancellationException: CancellationException) {
+                throw cancellationException
             } catch (e: Exception) {
-                Log.e("MusicViewModel", "Error artists", e)
+                Log.e("MusicViewModel", "Error loading artists (${e::class.simpleName})")
+                _artistLoadError.value = ProductFailurePresentation.from(
+                    getApplication<Application>(),
+                    e,
+                    fallback = getApplication<Application>().getString(R.string.product_failure_load_library)
+                ).message
             } finally {
-                _isLoading.value = false
+                _isLoadingArtists.value = false
             }
         }
     }
@@ -638,57 +1290,140 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         val section = _selectedSectionId.value
         if (section.isEmpty()) return
         viewModelScope.launch {
-            _isLoading.value = true
+            _isLoadingAlbums.value = true
+            _albumLoadError.value = null
             try {
-                _albums.value = repository.getAlbums(section)
+                _albums.value = loadLibraryAlbumsOverride?.invoke(section) ?: repository.getAlbums(section)
+            } catch (cancellationException: CancellationException) {
+                throw cancellationException
             } catch (e: Exception) {
-                Log.e("MusicViewModel", "Error albums", e)
+                Log.e("MusicViewModel", "Error loading albums (${e::class.simpleName})")
+                _albumLoadError.value = ProductFailurePresentation.from(
+                    getApplication<Application>(),
+                    e,
+                    fallback = getApplication<Application>().getString(R.string.product_failure_load_library)
+                ).message
             } finally {
-                _isLoading.value = false
+                _isLoadingAlbums.value = false
             }
         }
     }
 
     fun loadRecentlyAdded() {
         val section = _selectedSectionId.value
-        if (section.isEmpty()) return
+        val requestGeneration = ++recentlyAddedLoadGeneration
+        if (section.isEmpty()) {
+            _recentlyAddedAlbums.value = emptyList()
+            _recentlyAddedLoadError.value = null
+            _isLoadingRecentlyAdded.value = false
+            return
+        }
         viewModelScope.launch {
+            _isLoadingRecentlyAdded.value = true
             try {
-                _recentlyAddedAlbums.value = repository.getRecentlyAddedAlbums(section)
+                val recentAlbums = loadRecentlyAddedOverride?.invoke(section)
+                    ?: repository.getRecentlyAddedAlbums(section)
+                if (requestGeneration == recentlyAddedLoadGeneration) {
+                    _recentlyAddedAlbums.value = recentAlbums
+                    _recentlyAddedLoadError.value = null
+                }
+            } catch (cancellationException: CancellationException) {
+                throw cancellationException
             } catch (e: Exception) {
-                Log.e("MusicViewModel", "Error recently added", e)
+                if (requestGeneration == recentlyAddedLoadGeneration) {
+                    Log.e("MusicViewModel", "Error loading recently added music (${e::class.simpleName})")
+                    _recentlyAddedLoadError.value = ProductFailurePresentation.from(
+                        getApplication<Application>(),
+                        e,
+                        fallback = getApplication<Application>().getString(R.string.product_failure_load_library)
+                    ).message
+                }
+            } finally {
+                if (requestGeneration == recentlyAddedLoadGeneration) {
+                    _isLoadingRecentlyAdded.value = false
+                }
             }
         }
     }
 
-    fun loadArtistDetail(artistId: String) {
+    fun loadArtistDetail(artistId: String, fallbackName: String? = null) {
         viewModelScope.launch {
             _isLoading.value = true
+            _artistDetailLoadError.value = null
             _currentArtistMetadata.value = null
             _currentArtistTracks.value = emptyList()
             _artistProfile.value = null
+            _currentArtistAlbums.value = emptyList()
             try {
-                // Get artist metadata
-                val artistMeta = repository.getMetadataDetail(artistId)
-                _currentArtistMetadata.value = artistMeta
-                
-                // Get albums
-                val albums = repository.getArtistAlbums(artistId)
-                _currentArtistAlbums.value = albums
-                
-                // Fetch tracks for all albums
-                val allTracks = mutableListOf<PlexMetadata>()
-                albums.forEach { album ->
-                    val tracks = repository.getAlbumTracks(album.ratingKey)
-                    allTracks.addAll(tracks)
+                coroutineScope {
+                    // 1. Start fetching cached tracks immediately if we have a name (fastest path)
+                    val cachedTracksJob = if (fallbackName != null) {
+                        launch {
+                            val cached = repository.getArtistTracks(fallbackName)
+                            if (cached.isNotEmpty()) {
+                                _currentArtistTracks.value = cached
+                            }
+                        }
+                    } else null
+
+                    // 2. Fetch critical metadata and album list in parallel
+                    val metadataDeferred = async { repository.getMetadataDetail(artistId) }
+                    val albumsDeferred = async { repository.getArtistAlbumsForDetail(artistId) }
+
+                    var artistMeta = metadataDeferred.await()
+
+                    // 3. Fallback resolution if ID lookup failed
+                    if (artistMeta == null || (artistMeta.type != "artist" && fallbackName != null)) {
+                        val searchResults = repository.searchPlex(fallbackName ?: "")
+                        val found = searchResults.find { it.type == "artist" && it.title.equals(fallbackName, ignoreCase = true) }
+                        if (found != null) {
+                            artistMeta = repository.getMetadataDetail(found.ratingKey)
+                        }
+                    }
+
+                    val finalArtistId = artistMeta?.ratingKey ?: artistId
+                    val finalArtistName = artistMeta?.title ?: fallbackName ?: ""
+
+                    // 4. Update UI with metadata and albums
+                    val albums = albumsDeferred.await()
+                    _currentArtistMetadata.value = artistMeta
+                    _currentArtistAlbums.value = albums
+
+                    // 5. Ensure tracks are populated (either from the early job or a new search)
+                    cachedTracksJob?.join()
+                    if (_currentArtistTracks.value.isEmpty() && finalArtistName.isNotBlank()) {
+                        _currentArtistTracks.value = repository.getArtistTracks(finalArtistName)
+                    }
+
+                    // 6. Mark as "loaded" for perceived performance (shows core UI)
+                    _isLoading.value = false
+
+                    // 7. Background enrichment
+                    launch { loadArtistProfile(finalArtistId, finalArtistName) }
+                    launch {
+                        try {
+                            val albumsToFetch = if (albums.size > 20) albums.take(20) else albums
+                            val allTracks = albumsToFetch.map { album ->
+                                async { repository.getAlbumTracks(album.ratingKey) }
+                            }.awaitAll().flatten()
+
+                            if (allTracks.isNotEmpty()) {
+                                _currentArtistTracks.value = allTracks
+                            }
+                        } catch (e: Exception) {
+                            Log.e("MusicViewModel", "Error loading saved tracks (${e::class.simpleName})")
+                        }
+                    }
                 }
-                _currentArtistTracks.value = allTracks
-                
-                // Load bio/profile
-                loadArtistProfile(artistId, artistMeta?.title ?: "")
+            } catch (cancellationException: CancellationException) {
+                throw cancellationException
             } catch (e: Exception) {
-                Log.e("MusicViewModel", "Error artist detail", e)
-            } finally {
+                Log.e("MusicViewModel", "Error loading artist details (${e::class.simpleName})")
+                _artistDetailLoadError.value = ProductFailurePresentation.from(
+                    getApplication<Application>(),
+                    e,
+                    fallback = getApplication<Application>().getString(R.string.product_failure_load_library)
+                ).message
                 _isLoading.value = false
             }
         }
@@ -709,109 +1444,64 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun loadArtistProfile(artistId: String, artistName: String) {
         viewModelScope.launch {
-            // Cloud profile enrichment is opt-in through the selected provider.
-            val geminiApiKey = com.example.BuildConfig.GEMINI_API_KEY
-            val cloudEnabled = repository.settings.aiProvider == "CloudAIProvider" ||
-                repository.settings.aiProvider == "HybridAIProvider"
-            if (cloudEnabled && geminiApiKey.isNotEmpty() && !geminiApiKey.contains("GEMINI_API_KEY")) {
+            // SpotCore is authoritative for companion-backed artist metadata so
+            // the desktop Artist Context and this mobile Artist Bio stay in sync.
+            if (repository.settings.isCompanionConfigured && artistName.isNotBlank()) {
                 try {
-                    val systemInstructionText = """
-                        You are an expert music bio and metadata assistant.
-                        Your task is to return a JSON object containing information for the music artist requested.
-                        
-                        CRITICAL DIRECTIVES:
-                        1. Return ONLY a valid JSON object. No explanation, no markdown blocks, no conversational filler.
-                        2. The JSON object MUST strictly follow this schema:
-                        {
-                            "bio": "A 1-2 sentence compelling summary of the artist's history and style.",
-                            "similarArtists": [
-                                {"name": "Similar Artist Name", "style": "Genre/Style"}
-                            ],
-                            "styles": [
-                                "Genre Name"
-                            ]
-                        }
-                        3. Limit similarArtists to max 5 items, styles to max 3 items.
-                    """.trimIndent()
-
-                    val userPrompt = "Artist: $artistName"
-                    val request = com.example.data.GeminiRequest(
-                        contents = listOf(com.example.data.GeminiContent(parts = listOf(com.example.data.GeminiPart(text = userPrompt)))),
-                        systemInstruction = com.example.data.GeminiContent(parts = listOf(com.example.data.GeminiPart(text = systemInstructionText))),
-                        generationConfig = com.example.data.GeminiGenerationConfig(
-                            responseMimeType = "application/json",
-                            temperature = 0.5f
+                    val companionProfile = BackendClientManager
+                        .getApiService(repository.settings.companionBackendUrl)
+                        .getArtistProfile(
+                            artistName = artistName,
+                            plexTokenHeader = null,
+                            userAuthToken = "Bearer ${repository.settings.companionBackendToken}"
                         )
-                    )
-                    val response = com.example.data.GeminiClient.service.generateContent(geminiApiKey, request)
-                    val jsonText = response.candidates?.firstOrNull()?.content?.parts?.firstOrNull()?.text ?: ""
-                    
-                    val profile = parseArtistProfileFromJson(jsonText)
-                    if (profile != null) {
-                        _artistProfile.value = profile
+                        .artist
+                    if (companionProfile != null) {
+                        _artistProfile.value = ArtistProfile(
+                            bio = companionProfile.bio?.trim().takeUnless { it.isNullOrBlank() }
+                                ?: "No artist bio metadata is available from SpotCore.",
+                            artworkUrl = normalizeCompanionArtistArtworkUrl(
+                                companionBaseUrl = repository.settings.companionBackendUrl,
+                                artworkReference = companionProfile.coverUrl
+                            ),
+                            similarArtists = companionProfile.similarArtists
+                                .filter { it.name.isNotBlank() }
+                                .map { SimilarArtist(it.name, it.style) },
+                            styles = companionProfile.styles.filter { it.isNotBlank() }
+                        )
                         return@launch
                     }
                 } catch (e: Exception) {
-                    Log.e("MusicViewModel", "Error loading artist profile from Gemini", e)
+                    Log.e("MusicViewModel", "Error loading SpotCore artist profile (${e::class.simpleName})")
                 }
             }
 
             // Keep the local path honest when no cloud profile was requested or
             // when the provider has no verified profile result.
             _artistProfile.value = ArtistProfile(
-                bio = "No artist profile metadata is available in the indexed library.",
+                bio = "No artist bio metadata is available.",
                 similarArtists = emptyList(),
                 styles = emptyList()
             )
         }
     }
 
-    private fun parseArtistProfileFromJson(jsonText: String): ArtistProfile? {
-        try {
-            val clean = jsonText.trim()
-                .removeSurrounding("```json", "```")
-                .removeSurrounding("```", "```")
-                .trim()
-            val json = org.json.JSONObject(clean)
-            val bio = json.optString("bio", "")
-            
-            val similarList = mutableListOf<SimilarArtist>()
-            val similarArray = json.optJSONArray("similarArtists")
-            if (similarArray != null) {
-                for (i in 0 until similarArray.length()) {
-                    val item = similarArray.getJSONObject(i)
-                    similarList.add(
-                        SimilarArtist(
-                            name = item.optString("name", ""),
-                            style = item.optString("style", "")
-                        )
-                    )
-                }
-            }
-            
-            val stylesList = mutableListOf<String>()
-            val stylesArray = json.optJSONArray("styles")
-            if (stylesArray != null) {
-                for (i in 0 until stylesArray.length()) {
-                    stylesList.add(stylesArray.getString(i))
-                }
-            }
-            
-            return ArtistProfile(bio, similarList, stylesList)
-        } catch (e: Exception) {
-            Log.e("MusicViewModel", "Error parsing artist profile JSON", e)
-            return null
-        }
-    }
-
     fun loadAlbumDetail(albumId: String) {
         viewModelScope.launch {
             _isLoading.value = true
+            _albumDetailLoadError.value = null
             _currentAlbumTracks.value = emptyList()
             try {
-                _currentAlbumTracks.value = repository.getAlbumTracks(albumId)
+                _currentAlbumTracks.value = repository.getAlbumTracksForDetail(albumId)
+            } catch (cancellationException: CancellationException) {
+                throw cancellationException
             } catch (e: Exception) {
-                Log.e("MusicViewModel", "Error album detail", e)
+                Log.e("MusicViewModel", "Error loading album details (${e::class.simpleName})")
+                _albumDetailLoadError.value = ProductFailurePresentation.from(
+                    getApplication<Application>(),
+                    e,
+                    fallback = getApplication<Application>().getString(R.string.product_failure_load_library)
+                ).message
             } finally {
                 _isLoading.value = false
             }
@@ -819,48 +1509,86 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun search(query: String) {
+        val requestGeneration = ++searchGeneration
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
             if (query.isBlank()) {
                 _searchResults.value = emptyList()
                 _searchError.value = null
-                _isLoading.value = false
+                _isSearchLoading.value = false
                 return@launch
             }
             _searchResults.value = emptyList()
             _searchError.value = null
-            _isLoading.value = true
-            delay(150)
+            _isSearchLoading.value = true
+            delay(searchDebounceMillis)
             try {
-                val smartResults = repository.smartSearch(query)
-                _searchResults.value = if (smartResults.isNotEmpty()) {
-                    smartResults
-                } else if (com.example.data.SmartSearchService().isStructuredQuery(query) && repository.getCachedCount() > 0) {
-                    emptyList()
-                } else if (repository.settings.isCompanionConfigured) {
-                    runCatching { repository.searchCompanion(query) }
-                        .getOrElse { repository.searchPlex(query) }
-                } else {
-                    repository.searchPlex(query)
+                val results = searchResultsOverride?.invoke(query) ?: run {
+                    val smartResults = repository.smartSearch(query)
+                    if (smartResults.isNotEmpty()) {
+                        smartResults
+                    } else {
+                        val hasSavedLibrary = repository.getCachedCount() > 0
+                        if (hasSavedLibrary && (
+                                com.example.data.SmartSearchService().isStructuredQuery(query) ||
+                                    repository.isKnownAnalysisLabelQuery(query)
+                                )
+                        ) {
+                            emptyList()
+                        } else {
+                            repository.searchCompanion(query)
+                        }
+                    }
                 }
+                if (requestGeneration == searchGeneration) {
+                    _searchResults.value = results
+                }
+            } catch (cancellationException: CancellationException) {
+                throw cancellationException
             } catch (e: Exception) {
-                Log.e("MusicViewModel", "Error search", e)
-                _searchError.value = if (repository.getCachedCount() > 0) {
-                    "Backend search failed. Try again or search your cached library offline."
-                } else {
-                    "Search failed because no local library cache is available. Sync your library first."
+                if (requestGeneration == searchGeneration) {
+                    Log.e("MusicViewModel", "Error searching music (${e::class.simpleName})")
+                    _searchError.value = getApplication<Application>().getString(
+                        searchFailureString(hasSavedLibrary = repository.getCachedCount() > 0)
+                    )
                 }
             } finally {
-                _isLoading.value = false
+                if (requestGeneration == searchGeneration) {
+                    _isSearchLoading.value = false
+                }
             }
         }
     }
 
     fun syncLibraryCache() {
         val section = _selectedSectionId.value
-        if (section.isEmpty() && !repository.settings.isCompanionConfigured) return
+        if (section.isEmpty() && !repository.settings.isCompanionConfigured && enqueueLibrarySyncForQa == null) return
         viewModelScope.launch {
-            repository.startSync(if (section.isEmpty()) "spotcore" else section, restart = true)
+            enqueueLibrarySyncSafely(if (section.isEmpty()) "spotcore" else section, restart = true)
+        }
+    }
+
+    private suspend fun enqueueLibrarySyncSafely(
+        section: String,
+        restart: Boolean,
+        fallback: String = getApplication<Application>().getString(R.string.product_failure_sync_start_failed)
+    ) {
+        _libraryLoadError.value = null
+        _errorMessage.value = null
+        try {
+            val enqueue = enqueueLibrarySyncForQa
+            if (enqueue == null) repository.startSync(section, restart = restart)
+            else enqueue(section, restart)
+        } catch (cancellation: CancellationException) {
+            throw cancellation
+        } catch (error: Exception) {
+            val message = ProductFailurePresentation.from(
+                getApplication<Application>(),
+                error,
+                fallback = fallback
+            ).message
+            _libraryLoadError.value = message
+            _errorMessage.value = message
         }
     }
 
@@ -873,12 +1601,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val cachedTracks = repository.getCachedTracksList()
                 if (cachedTracks.isEmpty()) {
-                    _aiError.value = "Your library cache is empty. Please run sync first!"
+                    _aiError.value = getApplication<Application>().getString(R.string.playlist_generation_library_not_ready)
                     return@launch
                 }
 
                 val provider = when (repository.settings.aiProvider) {
-                    "CloudAIProvider" -> com.example.data.CloudAIProvider()
                     "LocalAIProvider" -> com.example.data.LocalAIProvider()
                     "LlamaCppAIProvider" -> com.example.data.LlamaCppAIProvider(
                         modelPath = repository.settings.aiModelPath,
@@ -892,17 +1619,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
                 Log.d("MusicViewModel", "Generating AI playlist using provider: ${provider.name}")
                 var explanationPrefix: String? = null
-                val rawIntent = try {
-                    provider.generatePlaylistIntent(prompt, cachedTracks)
-                } catch (e: Exception) {
-                    if (provider is com.example.data.CloudAIProvider) {
-                        Log.w("MusicViewModel", "Cloud AI failed; falling back to local on-device provider", e)
-                        explanationPrefix = "Cloud AI is not configured or offline. Fell back to fast local on-device parser.\n\n"
-                        com.example.data.LocalAIProvider().generatePlaylistIntent(prompt, cachedTracks)
-                    } else {
-                        throw e
-                    }
-                }
+                val rawIntent = provider.generatePlaylistIntent(prompt, cachedTracks)
                 val validation = com.example.data.AIOutputValidator.playlistIntent(rawIntent)
                 val intent = validation.value ?: com.example.data.PlaylistIntent(explanation = "AI output was invalid; using deterministic fallback.")
                 
@@ -919,11 +1636,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     _aiGeneratedTracks.value = tracks
                     playbackManager.playQueue(tracks, 0)
                 } else {
-                    _aiError.value = "The AI was unable to find matching tracks in your local library."
+                    _aiError.value = getApplication<Application>().getString(R.string.playlist_generation_no_matches)
                 }
             } catch (e: Exception) {
-                _aiError.value = e.localizedMessage ?: "Failed to generate AI playlist"
-                Log.e("MusicViewModel", "Error in generateAiPlaylist", e)
+                _aiError.value = getApplication<Application>().getString(R.string.playlist_generation_failed)
+                Log.e("MusicViewModel", "Error generating playlist (${e::class.simpleName})")
             } finally {
                 _aiLoading.value = false
             }
@@ -950,15 +1667,20 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             key = recent.key,
             thumb = recent.thumb,
             duration = 0L,
-            albumRatingKey = albumNavigationKey(recent.artist, recent.album)
+            albumRatingKey = albumNavigationKey(effectiveAlbumArtist(recent.albumArtist, recent.artist), recent.album),
+            albumArtist = effectiveAlbumArtist(recent.albumArtist, recent.artist)
         )
         playbackManager.playTrack(trackItem, listOf(trackItem))
     }
 
-    private fun mapMetadataToTrackItem(meta: PlexMetadata): TrackItem? {
+    fun mapMetadataToTrackItem(meta: PlexMetadata): TrackItem? {
         val key = meta.media?.firstOrNull()?.part?.firstOrNull()?.key ?: return null
-        val artist = meta.grandparentTitle ?: meta.parentTitle ?: "Unknown Artist"
-        val album = meta.parentTitle ?: "Unknown Album"
+        val unknownArtist = getApplication<Application>().getString(R.string.common_unknown_artist)
+        val unknownAlbum = getApplication<Application>().getString(R.string.common_unknown_album)
+        val artist = meta.grandparentTitle?.takeIf { it.isNotBlank() }
+            ?: meta.albumArtist?.takeIf { it.isNotBlank() }
+            ?: unknownArtist
+        val album = meta.parentTitle?.takeIf { it.isNotBlank() } ?: unknownAlbum
         return TrackItem(
             ratingKey = meta.ratingKey,
             title = meta.title,
@@ -967,17 +1689,104 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
             key = key,
             thumb = meta.thumb ?: "",
             duration = meta.duration ?: 0L,
-            albumRatingKey = meta.parentRatingKey ?: albumNavigationKey(artist, album)
+            albumRatingKey = meta.parentRatingKey ?: albumNavigationKey(meta.albumArtist ?: artist, album),
+            albumArtist = meta.albumArtist ?: artist,
+            artistRatingKey = meta.grandparentRatingKey ?: com.example.data.artistNavigationKey(artist),
+            index = meta.index ?: 0,
+            discNumber = meta.parentIndex?.takeIf { it > 0 } ?: 1
         )
     }
 
     fun clearErrorMessage() {
         _errorMessage.value = null
+        clearConnectionFailure()
+        clearHomeFeedFailure()
     }
 
-    suspend fun generateRadioTracks(request: RadioRequest): List<TrackItem> {
-        val cachedTracks = repository.getCachedTracksList()
-        return radioService.generate(request, cachedTracks, recentlyPlayed.value)
+    fun clearActionErrorMessage() {
+        _errorMessage.value = null
+    }
+
+    private fun setConnectionFailure(failure: FailurePresentation) {
+        _connectionErrorMessage.value = failure.message
+        _connectionErrorTechnicalDetails.value = failure.technicalDetails
+    }
+
+    private fun clearConnectionFailure() {
+        _connectionErrorMessage.value = null
+        _connectionErrorTechnicalDetails.value = null
+    }
+
+    private fun clearHomeFeedFailure() {
+        _homeFeedFailure.value = null
+    }
+
+    private fun companionUrlErrorResource(message: String?): Int = when (message) {
+        "SpotCore URL is empty" -> R.string.settings_spotcore_url_empty
+        "SpotCore URL must not contain credentials" -> R.string.settings_spotcore_url_credentials
+        "SpotCore URL must not contain a path" -> R.string.settings_spotcore_url_path
+        "SpotCore URL must not contain query or fragment" -> R.string.settings_spotcore_url_query
+        "SpotCore URL must use HTTPS" -> R.string.settings_spotcore_url_https
+        "Public SpotCore HTTP is not allowed; pair with the HTTPS endpoint" -> R.string.settings_spotcore_url_private_http
+        else -> R.string.settings_spotcore_url_invalid
+    }
+
+    suspend fun generateRadioTracks(request: RadioRequest): List<TrackItem> =
+        generateRadioTracks(request, useDiscoveryTuning = false)
+
+    suspend fun generateRadioTracks(
+        request: RadioRequest,
+        useDiscoveryTuning: Boolean
+    ): List<TrackItem> {
+        val tuning = _discoveryTuning.value
+        val library = repository.getCachedTracksList()
+        val candidates = if (useDiscoveryTuning) filterDiscoveryTracks(library, tuning) else library
+        val tunedRequest = if (useDiscoveryTuning) applyDiscoveryTuning(request, tuning) else request
+        return radioService.generate(tunedRequest, candidates, recentlyPlayed.value)
+    }
+
+    fun updateDiscoveryTuning(tuning: DiscoveryTuning) {
+        _discoveryTuning.value = discoveryTuningStore.save(tuning)
+    }
+
+    fun saveStationRecipe(recipe: SavedStationRecipe) {
+        _savedStationRecipes.value = stationRecipeStore.save(recipe)
+    }
+
+    fun renameStationRecipe(id: String, name: String) {
+        _savedStationRecipes.value = stationRecipeStore.rename(id, name)
+    }
+
+    fun deleteStationRecipe(id: String) {
+        _savedStationRecipes.value = stationRecipeStore.delete(id)
+    }
+
+    fun playStationRecipe(recipe: SavedStationRecipe) {
+        viewModelScope.launch {
+            try {
+                val tracks = generateSavedStationTracks(
+                    recipe = recipe,
+                    cachedTracks = repository.getCachedTracksList(),
+                    history = recentlyPlayed.value,
+                    radioService = radioService,
+                    tuning = _discoveryTuning.value
+                )
+                if (tracks.isNotEmpty()) {
+                    playbackManager.playQueue(tracks, 0)
+                    _errorMessage.value = null
+                } else {
+                    _errorMessage.value = getApplication<Application>().getString(
+                        radioNoMatchesString(runCatching { com.example.data.RadioType.valueOf(recipe.radioType) }
+                            .getOrDefault(com.example.data.RadioType.LIBRARY_RADIO))
+                    )
+                }
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (error: Exception) {
+                Log.w("MusicViewModel", "Could not restart saved station (${error::class.simpleName})")
+                _errorMessage.value = getApplication<Application>().getString(R.string.product_failure_generic)
+            }
+        }
     }
 
     fun postErrorMessage(message: String?) {
@@ -1013,7 +1822,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun playRadioRequest(request: RadioRequest, type: RadioType) {
             val cachedTracks = repository.getCachedTracksList()
             if (cachedTracks.isEmpty()) {
-                _errorMessage.value = "This radio needs an indexed library. Sync your music first."
+                _errorMessage.value = getApplication<Application>().getString(R.string.radio_needs_synced_library)
                 return
             }
 
@@ -1023,16 +1832,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                 playbackManager.playQueue(tracksToPlay, 0)
                 _errorMessage.value = null
             } else {
-                _errorMessage.value = when (type) {
-                    RadioType.ARTIST_RADIO -> "No cached tracks matched that artist."
-                    RadioType.ALBUM_RADIO -> "No cached tracks matched that album."
-                    RadioType.GENRE_RADIO, RadioType.MOOD_RADIO, RadioType.STYLE_RADIO -> "No cached tracks matched that genre or style."
-                    RadioType.COLLECTION_RADIO -> "No cached tracks matched that collection."
-                    RadioType.DECADE_RADIO, RadioType.TIME_TRAVEL -> "No cached tracks matched that decade."
-                    RadioType.SOUNDTRACK_RADIO -> "No soundtrack metadata is available in the indexed library."
-                    RadioType.FORGOTTEN_FAVORITES -> "There are no forgotten favorites in the cached history yet."
-                    else -> "This radio has no matching tracks in the cached library."
-                }
+                _errorMessage.value = getApplication<Application>().getString(radioNoMatchesString(type))
             }
     }
 
@@ -1067,11 +1867,11 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 data class ArtistProfile(
     val bio: String,
     val similarArtists: List<SimilarArtist>,
-    val styles: List<String>
+    val styles: List<String>,
+    val artworkUrl: String? = null
 )
 
 data class SimilarArtist(
     val name: String,
     val style: String
 )
-

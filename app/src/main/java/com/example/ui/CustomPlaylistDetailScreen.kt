@@ -19,15 +19,19 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import java.util.Locale
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
+import com.example.R
 import com.example.playback.TrackItem
 
 @Composable
@@ -64,12 +68,13 @@ fun CustomPlaylistDetailScreen(
         }
     }
 
-    val typeLabel = when (type) {
-        "daily_mix" -> "Daily Mix"
-        "radio" -> "Generated Radio"
-        "ai_playlist" -> "AI Smart Playlist"
-        else -> "Generated Mix"
+    val typeLabelRes = when (type) {
+        "daily_mix" -> R.string.custom_playlist_type_daily_mix
+        "radio" -> R.string.custom_playlist_type_radio
+        "ai_playlist" -> R.string.custom_playlist_type_smart_playlist
+        else -> R.string.custom_playlist_type_mix
     }
+    val typeLabel = stringResource(typeLabelRes)
 
     val typeIcon = when (type) {
         "daily_mix" -> Icons.Rounded.QueueMusic
@@ -101,7 +106,7 @@ fun CustomPlaylistDetailScreen(
                         modifier = Modifier
                             .statusBarsPadding()
                             .padding(16.dp)
-                            .size(40.dp)
+                            .size(48.dp)
                             .clip(RoundedCornerShape(20.dp))
                             .background(Color.Black.copy(alpha = 0.5f))
                             .align(Alignment.TopStart)
@@ -109,7 +114,7 @@ fun CustomPlaylistDetailScreen(
                     ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
-                            contentDescription = "Back",
+                            contentDescription = stringResource(R.string.playlist_detail_back),
                             tint = Color.White
                         )
                     }
@@ -188,9 +193,9 @@ fun CustomPlaylistDetailScreen(
                         Spacer(modifier = Modifier.height(4.dp))
 
                         Text(
-                            text = "$typeLabel • ${tracks.size} tracks",
+                            text = playlistDetailHeaderLabel(typeLabel, tracks.size),
                             style = MaterialTheme.typography.titleMedium.copy(
-                                color = gradientColors.firstOrNull() ?: Color(0xFF818CF8),
+                                color = MaterialTheme.colorScheme.primary,
                                 fontWeight = FontWeight.SemiBold
                             )
                         )
@@ -212,135 +217,30 @@ fun CustomPlaylistDetailScreen(
                 }
             }
 
-            // Playback & Playlist Action Buttons
+            // No playback or queue action is useful until this playlist has tracks.
             item {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    // Quick Play / Shuffle Row
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(16.dp)
-                    ) {
-                        // Play All Button
-                        Button(
-                            onClick = {
-                                viewModel.playbackManager.playQueue(tracks, 0)
-                            },
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(46.dp)
-                                .testTag("custom_playlist_play_all"),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = gradientColors.firstOrNull() ?: Color(0xFF818CF8),
-                                contentColor = Color.White
-                            )
-                        ) {
-                            Icon(imageVector = Icons.Rounded.PlayArrow, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Play All", fontWeight = FontWeight.Bold)
+                CustomPlaylistDetailActionsRow(
+                    playlistName = playlistName,
+                    trackCount = tracks.size,
+                    isSaved = isSaved,
+                    isDownloading = isDownloading,
+                    onPlayAll = { viewModel.playbackManager.playQueue(tracks, 0) },
+                    onShuffle = { viewModel.playbackManager.playQueue(tracks.shuffled(), 0) },
+                    onSave = {
+                        viewModel.savePlaylistWithTracks(playlistName, tracks) {
+                            isSaved = true
+                            Toast.makeText(
+                                context,
+                                context.getString(R.string.custom_playlist_saved_to_library, playlistName),
+                                Toast.LENGTH_SHORT
+                            ).show()
                         }
-
-                        // Shuffle Button
-                        OutlinedButton(
-                            onClick = {
-                                viewModel.playbackManager.playQueue(tracks.shuffled(), 0)
-                            },
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(46.dp)
-                                .testTag("custom_playlist_shuffle"),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.outlinedButtonColors(
-                                contentColor = Color.White
-                            ),
-                            border = ButtonDefaults.outlinedButtonBorder.copy()
-                        ) {
-                            Icon(imageVector = Icons.Rounded.Shuffle, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Shuffle", fontWeight = FontWeight.Bold)
-                        }
-                    }
-
-                    // Save & Download Action Row
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        // Save Playlist Button
-                        Button(
-                            onClick = {
-                                viewModel.savePlaylistWithTracks(playlistName, tracks) {
-                                    isSaved = true
-                                    Toast.makeText(context, "Saved '$playlistName' to local playlists!", Toast.LENGTH_SHORT).show()
-                                }
-                            },
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(44.dp)
-                                .testTag("custom_playlist_save"),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isSaved) Color(0xFF10B981) else Color.White.copy(alpha = 0.1f),
-                                contentColor = Color.White
-                            )
-                        ) {
-                            Icon(
-                                imageVector = if (isSaved) Icons.Rounded.Bookmark else Icons.Rounded.BookmarkAdd,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = if (isSaved) "Saved" else "Save to Library",
-                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold)
-                            )
-                        }
-
-                        // Download Playlist Tracks Button
-                        Button(
-                            onClick = {
-                                isDownloading = true
-                                viewModel.downloadTracksList(tracks)
-                                Toast.makeText(context, "Queued all ${tracks.size} tracks for offline download!", Toast.LENGTH_SHORT).show()
-                            },
-                            modifier = Modifier
-                                .weight(1f)
-                                .height(44.dp)
-                                .testTag("custom_playlist_download"),
-                            shape = RoundedCornerShape(12.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = if (isDownloading) Color(0xFF3B82F6) else Color.White.copy(alpha = 0.1f),
-                                contentColor = Color.White
-                            )
-                        ) {
-                            Icon(
-                                imageVector = if (isDownloading) Icons.Rounded.Downloading else Icons.Rounded.CloudDownload,
-                                contentDescription = null,
-                                modifier = Modifier.size(18.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = if (isDownloading) "Downloading..." else "Download All",
-                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold)
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Divider
-            item {
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 12.dp)
-                        .height(1.dp)
-                        .background(Color.White.copy(alpha = 0.08f))
+                    },
+                    onDownload = {
+                        isDownloading = true
+                        viewModel.downloadTracksList(tracks)
+                    },
+                    onAddToQueue = { viewModel.playbackManager.addTracksToQueue(tracks) }
                 )
             }
 
@@ -354,21 +254,28 @@ fun CustomPlaylistDetailScreen(
                         contentAlignment = Alignment.Center
                     ) {
                         Text(
-                            text = "This playlist is empty.",
+                            text = stringResource(R.string.playlist_detail_empty),
                             style = MaterialTheme.typography.bodyMedium.copy(color = Color.White.copy(alpha = 0.5f))
                         )
                     }
                 }
             } else {
-                itemsIndexed(tracks) { index, track ->
-                    CustomTrackRow(
-                        index = index + 1,
-                        track = track,
-                        onClick = {
-                            viewModel.playbackManager.playTrack(track, tracks)
-                        },
-                        isPlaying = currentTrack?.ratingKey == track.ratingKey
-                    )
+                itemsIndexed(tracks, key = { index, track -> "custom_track_${track.ratingKey}_$index" }) { index, track ->
+                    Column {
+                        CustomTrackRow(
+                            index = index + 1,
+                            track = track,
+                            onClick = {
+                                viewModel.playbackManager.playTrack(track, tracks)
+                            },
+                            isPlaying = currentTrack?.ratingKey == track.ratingKey
+                        )
+                        HorizontalDivider(
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+                            thickness = 0.5.dp,
+                            color = Color.White.copy(alpha = 0.05f)
+                        )
+                    }
                 }
             }
 
@@ -378,6 +285,117 @@ fun CustomPlaylistDetailScreen(
             }
         }
     }
+}
+
+@Composable
+internal fun CustomPlaylistDetailActionsRow(
+    playlistName: String,
+    trackCount: Int,
+    isSaved: Boolean,
+    isDownloading: Boolean,
+    onPlayAll: () -> Unit,
+    onShuffle: () -> Unit,
+    onSave: () -> Unit,
+    onDownload: () -> Unit,
+    onAddToQueue: () -> Unit
+) {
+    if (trackCount <= 0) return
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        IconButton(
+            onClick = onPlayAll,
+            modifier = Modifier
+                .size(48.dp)
+                .clip(RoundedCornerShape(24.dp))
+                .background(MaterialTheme.colorScheme.primary)
+                .testTag("custom_playlist_play_all")
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.PlayArrow,
+                contentDescription = stringResource(R.string.playlist_detail_play_all, playlistName),
+                tint = Color.White
+            )
+        }
+
+        Spacer(modifier = Modifier.width(16.dp))
+
+        IconButton(
+            onClick = onShuffle,
+            modifier = Modifier
+                .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                .testTag("custom_playlist_shuffle")
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.Shuffle,
+                contentDescription = stringResource(R.string.playlist_detail_shuffle, playlistName),
+                tint = Color.White,
+                modifier = Modifier.size(24.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.width(8.dp))
+
+        IconButton(
+            onClick = onSave,
+            enabled = !isSaved,
+            modifier = Modifier
+                .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                .testTag("custom_playlist_save")
+        ) {
+            Icon(
+                imageVector = if (isSaved) Icons.Rounded.Bookmark else Icons.Rounded.BookmarkAdd,
+                contentDescription = stringResource(
+                    if (isSaved) R.string.custom_playlist_saved_status else R.string.custom_playlist_save_action,
+                    playlistName
+                ),
+                tint = if (isSaved) Color(0xFF10B981) else Color.White,
+                modifier = Modifier.size(24.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.width(8.dp))
+
+        IconButton(
+            onClick = onDownload,
+            modifier = Modifier
+                .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                .testTag("custom_playlist_download")
+        ) {
+            Icon(
+                imageVector = if (isDownloading) Icons.Rounded.Downloading else Icons.Rounded.Download,
+                contentDescription = stringResource(R.string.custom_playlist_download_action, playlistName),
+                tint = Color.White,
+                modifier = Modifier.size(24.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.weight(1f))
+
+        IconButton(
+            onClick = onAddToQueue,
+            modifier = Modifier
+                .sizeIn(minWidth = 48.dp, minHeight = 48.dp)
+                .testTag("custom_playlist_add_to_queue")
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.PlaylistAdd,
+                contentDescription = stringResource(R.string.custom_playlist_queue_action, playlistName),
+                tint = Color.White,
+                modifier = Modifier.size(28.dp)
+            )
+        }
+    }
+
+    HorizontalDivider(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp),
+        thickness = 0.5.dp,
+        color = Color.White.copy(alpha = 0.1f)
+    )
 }
 
 @Composable
@@ -393,22 +411,22 @@ fun CustomTrackRow(
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
             .background(if (isPlaying) activeColor.copy(alpha = 0.15f) else Color.Transparent)
-            .clickable { onClick() }
-            .padding(vertical = 6.dp, horizontal = 12.dp),
+            .clickable(role = Role.Button, onClick = onClick)
+            .padding(vertical = 12.dp, horizontal = 16.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Track Index Number
+        // Track Index Number - Muted matching reference
         Text(
             text = index.toString(),
-            style = MaterialTheme.typography.bodyMedium.copy(
-                fontWeight = FontWeight.Bold,
-                color = Color.White.copy(alpha = 0.4f),
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontWeight = FontWeight.Normal,
+                color = Color.White.copy(alpha = 0.3f),
                 textAlign = TextAlign.Center
             ),
-            modifier = Modifier.width(28.dp)
+            modifier = Modifier.width(24.dp)
         )
 
-        Spacer(modifier = Modifier.width(12.dp))
+        Spacer(modifier = Modifier.width(16.dp))
 
         // Title and optional subtitle
         Column(modifier = Modifier.weight(1f)) {
@@ -416,15 +434,15 @@ fun CustomTrackRow(
                 text = track.title,
                 style = MaterialTheme.typography.bodyLarge.copy(
                     fontWeight = FontWeight.Bold,
-                color = if (isPlaying) activeColor else Color.White
+                    color = if (isPlaying) activeColor else Color.White
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
             Text(
-                text = "${track.artist} • ${track.album}",
-                style = MaterialTheme.typography.bodyMedium.copy(
-                    color = Color.White.copy(alpha = 0.6f)
+                text = localizedArtistAlbumSubtitle(track.artist, track.album),
+                style = MaterialTheme.typography.bodySmall.copy(
+                    color = Color.White.copy(alpha = 0.5f)
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -435,15 +453,15 @@ fun CustomTrackRow(
         val minutes = (track.duration / 1000) / 60
         val seconds = (track.duration / 1000) % 60
         val formattedDuration = if (track.duration > 0) {
-            String.format("%d:%02d", minutes, seconds)
+            String.format(Locale.ROOT, "%d:%02d", minutes, seconds)
         } else {
-            "3:45"
+            "--:--"
         }
 
         Text(
             text = formattedDuration,
-            style = MaterialTheme.typography.bodyMedium.copy(
-                color = Color.White.copy(alpha = 0.4f)
+            style = MaterialTheme.typography.bodySmall.copy(
+                color = Color.White.copy(alpha = 0.35f)
             ),
             modifier = Modifier.padding(end = 8.dp)
         )
